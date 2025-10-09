@@ -1,7 +1,6 @@
 # ──────────────────────────────────────────────────────────
 # 檔案：pages/02_🚀_執行分析.py
-# 說明：執行分析、分頁顯示、下載報表
-# 你只要把現有分析流程貼進 run_full_analysis() 即可
+# 說明：執行分析、分頁顯示、下載報表（含：鏡像與 DCA 比較分析，可勾選標的）
 # ──────────────────────────────────────────────────────────
 
 # pages/02_analyze.py
@@ -14,7 +13,6 @@ from collections import deque
 from dateutil.relativedelta import relativedelta
 
 import yfinance as yf
-from tqdm import tqdm
 
 st.title("🚀 Analyze")
 
@@ -85,7 +83,6 @@ def get_latest_fx_rate(currency: str, fx_data_dict: dict) -> float:
         return 1.0
     f = fx_data_dict.get(currency)
     if f is None or f.empty:
-        # 後備抓近5天
         try:
             sym = f"{currency}TWD=X"
             fx2 = yf.download(sym, period="5d", interval="1d", auto_adjust=True, progress=False)
@@ -144,7 +141,6 @@ class StockEventProcessor:
             (transaction_history["股票代號"]==ticker) &
             (transaction_history["日期"]<target_date)
         ]
-        # 你的資料：買為正、賣為負
         return max(0, float(t["購買股數"].sum()))
 
     def apply_stock_split_with_timing(self, position_data, ticker, split_date, split_ratio, transaction_history=None):
@@ -160,7 +156,6 @@ class StockEventProcessor:
                 return None
             add_shares = shares_before * (split_ratio - 1.0)
             pos["shares"] = original_shares + add_shares
-            # 總成本不變 → 平均成本降為：
             total_cost_foreign = original_avg_cost * original_shares
             if pos["shares"]>0:
                 pos["avg_cost_foreign"] = total_cost_foreign / pos["shares"]
@@ -168,7 +163,6 @@ class StockEventProcessor:
             pos["shares"] *= split_ratio
             pos["avg_cost_foreign"] /= split_ratio
 
-        # 更新台幣總成本（不變更匯率）
         if pos["shares"]>0 and pos["avg_cost_foreign"]>0:
             pos["total_cost_twd"] = pos["avg_cost_foreign"] * pos["shares"] * pos.get("avg_exchange_rate", pos.get("avg_fx", 1.0))
         return {
@@ -221,7 +215,6 @@ def build_fifo_inventory_with_cost_fixed(df_trades, fx_data_dict, latest_prices=
             while qty_to_sell > 1e-12 and fifo_positions[ticker]:
                 lot = fifo_positions[ticker][0]
                 take = min(lot["shares"], qty_to_sell)
-                # 分攤賣出手續費到每股
                 per_share_fee = fee/qty_to_sell if qty_to_sell>0 else 0.0
                 net_per_share = price - per_share_fee
                 pnl_foreign = (net_per_share - lot["price"]) * take
@@ -232,7 +225,6 @@ def build_fifo_inventory_with_cost_fixed(df_trades, fx_data_dict, latest_prices=
                     fifo_positions[ticker].popleft()
             fifo_realized_pnl_data[ticker] += realized
 
-    # 庫存明細
     for ticker, lots in fifo_positions.items():
         if not lots: continue
         currency = lots[0]["currency"]
@@ -283,27 +275,101 @@ def build_fifo_inventory_with_cost_fixed(df_trades, fx_data_dict, latest_prices=
 
     return pd.DataFrame(fifo_position_list), fifo_realized_pnl_data
 
+# ===== 投資比較：輔助函式 =====
+def get_price_on_or_before(date, ticker, stock_data_dict, min_date, max_date):
+    """用既有 stock_data_dict 找 <= 指定日 最近一筆收盤價；若無則補抓一次。"""
+    if ticker not in stock_data_dict or stock_data_dict[ticker].empty:
+        _df = download_stock_history(ticker, min_date, max_date)
+        stock_data_dict[ticker] = _df if not _df.empty else pd.DataFrame(columns=["日期","收盤價","股票代號"])
+    sdf = stock_data_dict[ticker]
+    if sdf.empty: return np.nan
+    sdf = sdf.sort_values("日期")
+    mask = sdf["日期"] <= pd.to_datetime(date).normalize()
+    if not mask.any():
+        return float(sdf["收盤價"].iloc[0])
+    return float(sdf.loc[mask, "收盤價"].iloc[-1])
+
+def build_mirror_trade_row(trade_date, cash_twd, target_ticker, fx_data_dict, stock_data_dict, min_date, max_date):
+    """回傳目標標的當日（或之前最近）價格與匯率（用於鏡像現金流換股數）。"""
+    target_ccy = determine_currency(target_ticker)
+    px = get_price_on_or_before(trade_date, target_ticker, stock_data_dict, min_date, max_date)
+    fx = get_fx_rate(pd.to_datetime(trade_date), target_ccy, fx_data_dict)
+    if np.isnan(px) or np.isnan(fx) or px <= 0 or fx <= 0:
+        return None
+    return {"_ok": True, "px": px, "fx": fx, "ccy": target_ccy}
+
+def make_mirror_trades(df_trades, target_ticker, fx_data_dict, stock_data_dict, min_date, max_date):
+    """用相同『台幣金額＋同日』把原現金流鏡像到指定目標標的。"""
+    rows = []
+    for _, r in df_trades.sort_values("日期").iterrows():
+        d = pd.to_datetime(r["日期"]).normalize()
+        shares = float(r["購買股數"])
+        price  = float(r["購買股價"])
+        fx_used = float(r.get("換匯匯率", 1.0))
+        tx_cost_foreign = float(r.get("交易成本", 0.0))
+
+        gross_foreign = price * abs(shares)
+        tx_cost_twd   = tx_cost_foreign * fx_used
+        cash_twd_abs  = gross_foreign * fx_used + tx_cost_twd
+        sign = 1 if shares > 0 else -1
+
+        info = build_mirror_trade_row(d, cash_twd_abs * sign, target_ticker, fx_data_dict, stock_data_dict, min_date, max_date)
+        if not info or not info.get("_ok", False):
+            continue
+
+        px_t, fx_t, ccy_t = info["px"], info["fx"], info["ccy"]
+        tx_cost_foreign_target = tx_cost_twd / fx_t
+        notional_twd_abs = gross_foreign * fx_used
+        shares_target = (notional_twd_abs / (px_t * fx_t)) * sign
+
+        rows.append({
+            "日期": d, "股票代號": target_ticker, "購買股數": shares_target,
+            "購買股價": px_t, "換匯匯率": fx_t, "交易成本": tx_cost_foreign_target, "幣別": ccy_t
+        })
+    df_alt = pd.DataFrame(rows)
+    for col in ["投資金額","交易金額"]:
+        if col not in df_alt.columns: df_alt[col] = np.nan
+    return df_alt
+
+def make_monthly_dca_trades(start_date, end_date, amount_twd, target_ticker, fx_data_dict, stock_data_dict, dca_day=1):
+    """每月 dca_day 定期定額台幣 amount_twd ；遇假日取之前最近收盤價。"""
+    rows = []
+    cur = pd.to_datetime(start_date).replace(day=dca_day)
+    end_date = pd.to_datetime(end_date)
+    while cur <= end_date:
+        px = get_price_on_or_before(cur, target_ticker, stock_data_dict, start_date, end_date)
+        ccy = determine_currency(target_ticker)
+        fx  = get_fx_rate(cur, ccy, fx_data_dict)
+        if (not np.isnan(px)) and (not np.isnan(fx)) and px > 0 and fx > 0:
+            shares = (amount_twd / (px * fx))
+            rows.append({
+                "日期": cur.normalize(), "股票代號": target_ticker, "購買股數": shares,
+                "購買股價": px, "換匯匯率": fx, "交易成本": 0.0, "幣別": ccy
+            })
+        cur = cur + relativedelta(months=1)
+    df_dca = pd.DataFrame(rows)
+    for col in ["投資金額","交易金額"]:
+        if col not in df_dca.columns: df_dca[col] = np.nan
+    return df_dca
+
 # ========= 主流程 =========
-def run_full_analysis(trades_df: pd.DataFrame) -> dict:
+def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
+                      mirror_list=None, dca_list=None, dca_day: int = 1) -> dict:
     # 1) 欄位準備
     df = trades_df.copy()
-    # 日期
     if "日期" not in df.columns:
         raise ValueError("找不到『日期』欄，請提供「日期」欄位。")
     df["日期"] = pd.to_datetime(df["日期"]).dt.normalize()
 
-    # 必要交易欄
     for need in ["股票代號","購買股數","購買股價"]:
         if need not in df.columns:
             raise ValueError(f"找不到必要欄位：{need}")
     if "交易成本" not in df.columns: df["交易成本"] = 0.0
     if "換匯匯率" not in df.columns: df["換匯匯率"] = 1.0
 
-    # 幣別
     if "幣別" not in df.columns:
         df["幣別"] = df["股票代號"].apply(determine_currency)
 
-    # 交易明細（有效資料）
     df_trades = df[df["購買股數"].notna() & df["購買股價"].notna()].copy()
     df_trades["交易成本"]   = pd.to_numeric(df_trades["交易成本"], errors="coerce").fillna(0.0)
     df_trades["換匯匯率"]   = pd.to_numeric(df_trades["換匯匯率"], errors="coerce").fillna(1.0)
@@ -366,13 +432,12 @@ def run_full_analysis(trades_df: pd.DataFrame) -> dict:
             pos["total_cost_twd"] = new_cost_twd
         else:
             sell = abs(sh)
-            if pos["shares"] >= sell and pos["shares"]>0:
+            if position_data[tkr]["shares"] >= sell and position_data[tkr]["shares"]>0:
                 gross = px*sell; net = gross - fee
-                cost_basis_f = pos["avg_cost_foreign"]*sell
+                cost_basis_f = position_data[tkr]["avg_cost_foreign"]*sell
                 real_f = (net - cost_basis_f)
-                real_twd = real_f * pos["avg_exchange_rate"]
+                real_twd = real_f * position_data[tkr]["avg_exchange_rate"]
                 realized["total_realized_pnl"] += real_twd
-                # 純成本外幣總額扣減
                 cost_pure_foreign = (pos["pure_cost_foreign_total"]/pos["shares"]) * sell if pos["shares"]>0 else 0.0
                 pos["pure_cost_foreign_total"] -= cost_pure_foreign
                 pos["shares"] -= sell
@@ -385,7 +450,6 @@ def run_full_analysis(trades_df: pd.DataFrame) -> dict:
 
     # 5) 股票分割（依時間）
     event_processor = StockEventProcessor()
-    # 交易歷史 (供 splits 計算分割前 shares)
     transaction_history = df_trades[["日期","股票代號","購買股數"]].copy()
     for tkr in position_data.keys():
         event_processor.fetch_stock_events(tkr, min_date, max_date)
@@ -463,7 +527,6 @@ def run_full_analysis(trades_df: pd.DataFrame) -> dict:
     display_df["標的衡量日現價"] = display_df["股票代號"].map(latest_prices).astype(float)
     display_df["外匯現價"] = display_df["幣別"].apply(lambda c: float(get_latest_fx_rate(c, fx_data_dict)) if pd.notna(c) else np.nan)
 
-    # 用平均成本池（每檔獨立）回放以產生『賣出列的已實現』與『買進剩餘的未實現』
     for ticker, g in df_trades.sort_values("日期").groupby("股票代號"):
         g = g.copy()
         currency   = g["幣別"].iloc[0]
@@ -510,7 +573,6 @@ def run_full_analysis(trades_df: pd.DataFrame) -> dict:
                 display_df.loc[idx, "已實現總損益(台幣)"]   = real_total_twd
                 display_df.loc[idx, "已實現投資匯率損益(台幣)"] = real_fx_twd
 
-                # buy lots 比例扣除（只為了計算哪些買進仍有剩）
                 total_open = sum(l["remain"] for l in buy_lots)
                 left = sell_qty
                 for i, lot in enumerate(buy_lots):
@@ -532,7 +594,6 @@ def run_full_analysis(trades_df: pd.DataFrame) -> dict:
                     pool_total_cost_foreign = pool_avg_cost_foreign * pool_shares
                     pool_total_cost_twd     = pool_avg_cost_foreign * pool_shares * pool_avg_fx
 
-        # 對仍有剩的買進 lot，分配未實現
         if (not np.isnan(latest_px)) and (not np.isnan(latest_fx)):
             for lot in buy_lots:
                 remain = float(lot["remain"])
@@ -548,7 +609,6 @@ def run_full_analysis(trades_df: pd.DataFrame) -> dict:
     # 10) 投組每日總彙整（到今天）
     today_tw = pd.Timestamp.today(tz="Asia/Taipei").normalize().tz_localize(None)
     all_dates = pd.date_range(min_date, today_tw, freq="D")
-    # 股價與匯率序列（ffill）
     stock_close_daily = {}
     for tkr, sdf in stock_data_dict.items():
         if sdf is None or sdf.empty: continue
@@ -563,7 +623,6 @@ def run_full_analysis(trades_df: pd.DataFrame) -> dict:
         ser.index = pd.to_datetime(ser.index).normalize()
         fx_daily[cur] = ser.reindex(all_dates).ffill()
 
-    # 現金部位（可選）
     if "預算餘額" in df.columns:
         cash_series = df[["日期","預算餘額"]].dropna(subset=["日期"]).copy()
         cash_series["日期"] = pd.to_datetime(cash_series["日期"]).dt.normalize()
@@ -577,7 +636,6 @@ def run_full_analysis(trades_df: pd.DataFrame) -> dict:
     else:
         cash_by_day = pd.Series(0.0, index=all_dates)
 
-    # 回放交易，逐日評價
     positions = {}
     cum_realized_twd = 0.0
     trades_sorted = df_trades.sort_values("日期").copy()
@@ -620,7 +678,6 @@ def run_full_analysis(trades_df: pd.DataFrame) -> dict:
                         real_f = (net - p["avg_cost_foreign"]*sell)
                         real_t = real_f * p["avg_fx"]
                         cum_realized_twd += real_t
-                        # 純成本扣減
                         cpp = (p["pure_cost_foreign_total"]/p["shares"])*sell if p["shares"]>0 else 0.0
                         p["pure_cost_foreign_total"] -= cpp
                         p["shares"] -= sell
@@ -697,6 +754,131 @@ def run_full_analysis(trades_df: pd.DataFrame) -> dict:
         "daily_equity": daily_portfolio_df[["日期","投組總額_日報"]],
         "display_detail": display_df
     }
+
+    # =====================================================
+    # ＊比較分析（鏡像 + DCA）：動態標的（mirror_list / dca_list），可調 DCA 金額與扣款日
+    # =====================================================
+    comparison_results = []
+    compare_sheets = {}
+
+    # 預設標的（若使用者未選擇）
+    default_targets = ["SPY", "0050.TW", "2330.TW"]
+    mirror_targets = mirror_list if mirror_list else default_targets
+    dca_targets    = dca_list if dca_list else default_targets
+
+    def _evaluate_portfolio_fast(df_trades_like):
+        pos = {}
+        realized = {}
+        for _, row in df_trades_like.sort_values("日期").iterrows():
+            tkr = row["股票代號"]; sh = float(row["購買股數"]); px = float(row["購買股價"])
+            fx  = float(row.get("換匯匯率", 1.0)); fee = float(row.get("交易成本", 0.0))
+            ccy = row.get("幣別", determine_currency(tkr))
+            if tkr not in pos:
+                pos[tkr] = {"shares":0.0,"avg_cost_foreign":0.0,"avg_fx":0.0,"total_cost_twd":0.0,"currency":ccy}
+                realized[tkr] = 0.0
+            p = pos[tkr]
+            if sh > 0:
+                actual = (px*sh+fee)/sh
+                new_sh = p["shares"] + sh
+                new_cf = p["avg_cost_foreign"]*p["shares"] + actual*sh
+                new_ct = p["total_cost_twd"] + actual*sh*fx
+                p["shares"] = new_sh
+                if new_sh>0:
+                    p["avg_cost_foreign"] = new_cf/new_sh
+                    p["avg_fx"]           = (new_ct/new_cf) if new_cf>0 else 1.0
+                    p["total_cost_twd"]   = p["avg_cost_foreign"]*p["shares"]*p["avg_fx"]
+                else:
+                    p["avg_cost_foreign"]=0.0; p["avg_fx"]=1.0; p["total_cost_twd"]=0.0
+            else:
+                sell = abs(sh)
+                if p["shares"] < sell or p["shares"]<=0: continue
+                gross = px*sell; net = gross - fee
+                total_foreign  = (net/sell - p["avg_cost_foreign"]) * sell
+                total_twd      = total_foreign * p["avg_fx"]
+                realized[tkr] += total_twd
+                p["shares"] -= sell
+                if p["shares"]>0:
+                    p["total_cost_twd"] = p["avg_cost_foreign"]*p["shares"]*p["avg_fx"]
+                else:
+                    p["avg_cost_foreign"]=0.0; p["avg_fx"]=1.0; p["total_cost_twd"]=0.0
+
+        rows=[]
+        for tkr, p in pos.items():
+            if p["shares"]<=0: continue
+            latest_px = get_price_on_or_before(max_date, tkr, stock_data_dict, min_date, max_date)
+            latest_fx = get_latest_fx_rate(p["currency"], fx_data_dict)
+            mv_twd = latest_px * p["shares"] * latest_fx
+            unreal_invest_twd = (latest_px - p["avg_cost_foreign"]) * p["shares"] * latest_fx
+            unreal_total_twd  = mv_twd - p["total_cost_twd"]
+            rows.append({
+                "股票代號": tkr, "幣別": p["currency"], "持有股數": p["shares"],
+                "平均成本(原幣)": p["avg_cost_foreign"], "平均匯率成本": p["avg_fx"],
+                "總成本(台幣)": p["total_cost_twd"], "現價(原幣)": latest_px,
+                "最新匯率": latest_fx, "市值(台幣)": mv_twd,
+                "未實現投資損益(台幣)": unreal_invest_twd, "未實現總損益(台幣)": unreal_total_twd,
+                "未實現投資匯率損益(台幣)": unreal_total_twd - unreal_invest_twd
+            })
+        position_df_alt = pd.DataFrame(rows).sort_values("股票代號")
+        realized_total_twd = sum(realized.values())
+        total_cost_twd = float(position_df_alt["總成本(台幣)"].sum()) if not position_df_alt.empty else 0.0
+        total_mv_twd   = float(position_df_alt["市值(台幣)"].sum()) if not position_df_alt.empty else 0.0
+        total_unreal_twd = float(position_df_alt["未實現總損益(台幣)"].sum()) if not position_df_alt.empty else 0.0
+        total_pnl_twd  = realized_total_twd + total_unreal_twd
+        total_return   = (total_pnl_twd / total_cost_twd) if total_cost_twd > 0 else np.nan
+        summary_alt = {
+            "總成本(台幣)": total_cost_twd, "市值(台幣)": total_mv_twd,
+            "未實現損益(台幣)": total_unreal_twd, "已實現損益(台幣)": realized_total_twd,
+            "總損益(台幣)": total_pnl_twd, "報酬率": total_return
+        }
+        return position_df_alt, realized, summary_alt
+
+    # 鏡像（依勾選）
+    for tgt in mirror_targets:
+        df_m = make_mirror_trades(df_trades, tgt, fx_data_dict, stock_data_dict, min_date, max_date)
+        if df_m.empty:
+            continue
+        pos_m, _, sum_m = _evaluate_portfolio_fast(df_m)
+        disp_m = df_m.copy().sort_values("日期")
+        disp_m["歷史匯率"] = disp_m["換匯匯率"]
+        disp_m = disp_m[["日期","股票代號","幣別","購買股數","購買股價","換匯匯率","歷史匯率","交易成本"]]
+        name = tgt.replace(".TW","").replace(".T","")
+        compare_sheets[f"鏡像_{name}_買賣明細"] = disp_m
+        compare_sheets[f"鏡像_{name}_庫存摘要"] = pos_m
+        r = {"策略": f"鏡像-{name}"}; r.update(sum_m); comparison_results.append(r)
+
+    # DCA（依勾選）
+    for tgt in dca_targets:
+        df_d = make_monthly_dca_trades(min_date, max_date, dca_amount_twd, tgt, fx_data_dict, stock_data_dict, dca_day=dca_day)
+        if df_d.empty:
+            continue
+        pos_d, _, sum_d = _evaluate_portfolio_fast(df_d)
+        disp_d = df_d.copy().sort_values("日期")
+        disp_d["歷史匯率"] = disp_d["換匯匯率"]
+        disp_d = disp_d[["日期","股票代號","幣別","購買股數","購買股價","換匯匯率","歷史匯率","交易成本"]]
+        name = tgt.replace(".TW","").replace(".T","")
+        compare_sheets[f"DCA_{name}_買賣明細"] = disp_d
+        compare_sheets[f"DCA_{name}_庫存摘要"] = pos_d
+        r = {"策略": f"DCA-{name}"}; r.update(sum_d); comparison_results.append(r)
+
+    # 原投組 summary 放第一列
+    base_summary = {
+        "策略": "你的投組(平均成本法)",
+        "總成本(台幣)": total_twd_cost,
+        "市值(台幣)": total_twd_value,
+        "未實現損益(台幣)": total_unreal,
+        "已實現損益(台幣)": total_realized,
+        "總損益(台幣)": total_unreal + total_realized,
+        "報酬率": ( (total_unreal + total_realized) / total_twd_cost ) if total_twd_cost>0 else np.nan
+    }
+    if comparison_results:
+        comparison_results.insert(0, base_summary)
+        comparison_df = pd.DataFrame(comparison_results)[
+            ["策略","總成本(台幣)","市值(台幣)","未實現損益(台幣)","已實現損益(台幣)","總損益(台幣)","報酬率"]
+        ].copy()
+        dataframes["comparison_overview"] = comparison_df
+        for k, v in compare_sheets.items():
+            dataframes[k] = v
+
     return {
         "meta":{"start":min_date,"end":max_date,"records":len(df_trades)},
         "dataframes": dataframes,
@@ -704,11 +886,35 @@ def run_full_analysis(trades_df: pd.DataFrame) -> dict:
         "report_bytes": make_excel_report(dataframes)
     }
 
-# ====== UI ======
+# ====== UI：比較標的與 DCA 參數 ======
+st.divider()
+col1, col2 = st.columns([2,1])
+with col1:
+    compare_choices = st.multiselect(
+        "選擇比較標的（鏡像 + DCA）",
+        options=["SPY", "0050.TW", "2330.TW"],
+        default=["SPY", "0050.TW", "2330.TW"],
+        help="鏡像與 DCA 都會使用這些標的。你可只選部分。"
+    )
+with col2:
+    dca_day = st.number_input("DCA 扣款日（每月）", min_value=1, max_value=28, value=1, step=1)
+
+dca_amount_twd = st.number_input(
+    "DCA 每月定額金額（台幣）", min_value=0, step=10000, value=70000,
+    help="用於 DCA 比較分析的每月定額金額"
+)
+
+# ====== Run ======
 if st.button("Run Analysis", type="primary", use_container_width=True):
     with st.status("Running analysis...", expanded=False):
         try:
-            result = run_full_analysis(df_input)
+            result = run_full_analysis(
+                df_input,
+                dca_amount_twd=dca_amount_twd,
+                mirror_list=compare_choices,
+                dca_list=compare_choices,
+                dca_day=dca_day
+            )
             st.session_state["analysis_result"] = result
             st.success("Done!")
         except Exception as e:
@@ -729,10 +935,14 @@ if result:
         use_container_width=True
     )
 
-    tabs = st.tabs([
+    tab_names = [
         "Summary", "Trades", "Positions (Avg)", "Positions (FIFO)",
         "Realized P/L", "Costs", "Daily Equity", "Detail (Buy/Sell)"
-    ])
+    ]
+    if "comparison_overview" in dfs:
+        tab_names.append("Comparisons")
+
+    tabs = st.tabs(tab_names)
 
     with tabs[0]:
         st.subheader("Summary")
@@ -774,3 +984,15 @@ if result:
         st.subheader("Detail (Buy/Sell) with P/L Columns")
         st.dataframe(dfs["display_detail"], use_container_width=True)
         st.download_button("display_detail.csv", dfs["display_detail"].to_csv(index=False).encode("utf-8-sig"), "display_detail.csv", "text/csv")
+
+    if "comparison_overview" in dfs:
+        with tabs[-1]:
+            st.subheader("六組策略 vs 你的投組（概覽）")
+            st.dataframe(dfs["comparison_overview"], use_container_width=True)
+            st.download_button(
+                "comparison_overview.csv",
+                dfs["comparison_overview"].to_csv(index=False).encode("utf-8-sig"),
+                "comparison_overview.csv",
+                "text/csv"
+            )
+
