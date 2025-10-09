@@ -1284,7 +1284,7 @@ if total_cost > 0:
     print(f"總投資報酬率：{(total_pnl/total_cost)*100:.2f}%")
 
 #colab update
-!pip install xlsxwriter
+#!pip install xlsxwriter #streamlit-remove
 
 # ✅ 輸出至 Excel 報表
 
@@ -1752,7 +1752,7 @@ print(display_df.head(12).to_string(index=False))
 
 
 #colab update
-!pip install xlsxwriter
+#!pip install xlsxwriter #streamlit-remove
 
 # ✅ 輸出至 Excel 報表（買賣明細含 6 個損益欄 + 2 個現價欄）
 output_file = "/content/投資分析報表.xlsx"
