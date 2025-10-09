@@ -6,3 +6,6 @@ xlsxwriter
 plotly
 requests
 chardet
+yfinance
+tqdm
+python-dateutil
