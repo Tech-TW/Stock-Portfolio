@@ -1,9 +1,8 @@
 # ──────────────────────────────────────────────────────────
 # 檔案：pages/02_🚀_執行分析.py
-# 說明：執行分析、分頁顯示、下載報表（含：鏡像與 DCA 比較分析，可勾選標的 + 權益曲線比較）
+# 說明：執行分析、分頁顯示、下載報表（含：鏡像、DCA、Lump Sum 比較分析）
 # ──────────────────────────────────────────────────────────
 
-# pages/02_analyze.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -11,7 +10,6 @@ from io import BytesIO
 from datetime import datetime, timedelta
 from collections import deque
 from dateutil.relativedelta import relativedelta
-
 import yfinance as yf
 
 st.title("🚀 Analyze")
@@ -48,7 +46,6 @@ def determine_currency(ticker: str) -> str:
     return "USD"
 
 def download_fx_history(currency: str, start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
-    """下載指定幣別對台幣的歷史匯率 (Yahoo: XXXTWD=X)"""
     if currency == "TWD":
         return pd.DataFrame({"日期":[start_date], "匯率":[1.0], "幣別":["TWD"]})
     try:
@@ -203,7 +200,7 @@ def build_fifo_inventory_with_cost_fixed(df_trades, fx_data_dict, latest_prices=
             actual_cost_ps = (price * shares + fee) / shares
             fifo_positions[ticker].append({
                 "shares": shares,
-                "price": actual_cost_ps,      # 含交易成本
+                "price": actual_cost_ps,
                 "original_price": price,
                 "fx": fx,
                 "transaction_cost": fee,
@@ -277,7 +274,6 @@ def build_fifo_inventory_with_cost_fixed(df_trades, fx_data_dict, latest_prices=
 
 # ===== 投資比較：輔助函式 =====
 def get_price_on_or_before(date, ticker, stock_data_dict, min_date, max_date):
-    """用既有 stock_data_dict 找 <= 指定日 最近一筆收盤價；若無則補抓一次。"""
     if ticker not in stock_data_dict or stock_data_dict[ticker].empty:
         _df = download_stock_history(ticker, min_date, max_date)
         stock_data_dict[ticker] = _df if not _df.empty else pd.DataFrame(columns=["日期","收盤價","股票代號"])
@@ -290,7 +286,6 @@ def get_price_on_or_before(date, ticker, stock_data_dict, min_date, max_date):
     return float(sdf.loc[mask, "收盤價"].iloc[-1])
 
 def build_mirror_trade_row(trade_date, cash_twd, target_ticker, fx_data_dict, stock_data_dict, min_date, max_date):
-    """回傳目標標的當日（或之前最近）價格與匯率（用於鏡像現金流換股數）。"""
     target_ccy = determine_currency(target_ticker)
     px = get_price_on_or_before(trade_date, target_ticker, stock_data_dict, min_date, max_date)
     fx = get_fx_rate(pd.to_datetime(trade_date), target_ccy, fx_data_dict)
@@ -299,7 +294,6 @@ def build_mirror_trade_row(trade_date, cash_twd, target_ticker, fx_data_dict, st
     return {"_ok": True, "px": px, "fx": fx, "ccy": target_ccy}
 
 def make_mirror_trades(df_trades, target_ticker, fx_data_dict, stock_data_dict, min_date, max_date):
-    """用相同『台幣金額＋同日』把原現金流鏡像到指定目標標的。"""
     rows = []
     for _, r in df_trades.sort_values("日期").iterrows():
         d = pd.to_datetime(r["日期"]).normalize()
@@ -332,7 +326,6 @@ def make_mirror_trades(df_trades, target_ticker, fx_data_dict, stock_data_dict, 
     return df_alt
 
 def make_monthly_dca_trades(start_date, end_date, amount_twd, target_ticker, fx_data_dict, stock_data_dict, dca_day=1):
-    """每月 dca_day 定期定額台幣 amount_twd ；遇假日取之前最近收盤價。"""
     rows = []
     cur = pd.to_datetime(start_date).replace(day=dca_day)
     end_date = pd.to_datetime(end_date)
@@ -352,9 +345,55 @@ def make_monthly_dca_trades(start_date, end_date, amount_twd, target_ticker, fx_
         if col not in df_dca.columns: df_dca[col] = np.nan
     return df_dca
 
+# === 新增：Lump Sum（由「投資預算總水位」的上升量驅動一次性投入） ===
+def make_lumpsum_trades_from_budget(df_all: pd.DataFrame, target_ticker: str,
+                                    fx_data_dict: dict, stock_data_dict: dict,
+                                    min_date: pd.Timestamp, max_date: pd.Timestamp) -> pd.DataFrame:
+    """
+    從 df_all 中的『投資預算總水位』偵測上升量（含第一日由0起算），
+    每次上升金額在當日一次性買入 target_ticker。
+    """
+    if "投資預算總水位" not in df_all.columns:
+        return pd.DataFrame(columns=["日期","股票代號","購買股數","購買股價","換匯匯率","交易成本","幣別"])
+
+    ser = (df_all[["日期","投資預算總水位"]]
+           .dropna(subset=["日期"])
+           .assign(日期=lambda x: pd.to_datetime(x["日期"]).dt.normalize())
+           .sort_values(["日期"])
+           .drop_duplicates(subset=["日期"], keep="last"))
+    ser["投資預算總水位"] = pd.to_numeric(ser["投資預算總水位"], errors="coerce")
+    ser = ser.dropna(subset=["投資預算總水位"])
+
+    if ser.empty:
+        return pd.DataFrame(columns=["日期","股票代號","購買股數","購買股價","換匯匯率","交易成本","幣別"])
+
+    ser["prev"] = ser["投資預算總水位"].shift(1).fillna(0.0)
+    ser["delta"] = ser["投資預算總水位"] - ser["prev"]
+    ser = ser[ser["delta"] > 0]
+
+    rows = []
+    tgt_ccy = determine_currency(target_ticker)
+    for _, r in ser.iterrows():
+        d = r["日期"]
+        amt_twd = float(r["delta"])
+        px = get_price_on_or_before(d, target_ticker, stock_data_dict, min_date, max_date)
+        fx = get_fx_rate(d, tgt_ccy, fx_data_dict)
+        if np.isnan(px) or np.isnan(fx) or px <= 0 or fx <= 0 or amt_twd <= 0:
+            continue
+        shares = amt_twd / (px * fx)
+        rows.append({
+            "日期": d, "股票代號": target_ticker, "購買股數": shares,
+            "購買股價": px, "換匯匯率": fx, "交易成本": 0.0, "幣別": tgt_ccy
+        })
+    df_ls = pd.DataFrame(rows)
+    for col in ["投資金額","交易金額"]:
+        if col not in df_ls.columns: df_ls[col] = np.nan
+    return df_ls
+
 # ========= 主流程 =========
 def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
-                      mirror_list=None, dca_list=None, dca_day: int = 1) -> dict:
+                      mirror_list=None, dca_list=None, dca_day: int = 1,
+                      lumpsum_list=None) -> dict:
     # 1) 欄位準備
     df = trades_df.copy()
     if "日期" not in df.columns:
@@ -515,7 +554,7 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         df_trades, fx_data_dict, latest_prices
     )
 
-    # 9) 明細表 display_df（含現價＆6欄損益）
+    # 9) 明細表 display_df
     display_cols = ["日期","股票代號","幣別","購買股數","購買股價","換匯匯率","購買當時匯率","交易成本"]
     display_df = df_trades[[c for c in display_cols if c in df_trades.columns]].copy()
     for col in [
@@ -726,11 +765,6 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
 
     # === (新增) 比較策略：每日權益曲線產生器 ===
     def _equity_curve_for_trades(df_trades_like: pd.DataFrame, label: str) -> pd.DataFrame:
-        """
-        用既有 all_dates / stock_close_daily / fx_daily 模擬該組交易的每日權益（市值 + 累計已實現）。
-        不含現金（視為 0）。
-        回傳欄位：['日期', label]
-        """
         if df_trades_like is None or df_trades_like.empty:
             return pd.DataFrame(columns=["日期", label])
 
@@ -745,9 +779,9 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         df_like["幣別"] = df_like.get("幣別", df_like["股票代號"].apply(determine_currency))
 
         like_by_day = {d: g for d, g in df_like.sort_values("日期").groupby("日期")}
+        last_day_local = all_dates[-1]
 
         for day in all_dates:
-            # 過帳當日交易
             if day in like_by_day:
                 for _, r in like_by_day[day].iterrows():
                     tkr = r["股票代號"]; sh = float(r["購買股數"]); px = float(r["購買股價"])
@@ -792,13 +826,12 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
                             p["avg_fx"] = 1.0
                             p["total_cost_twd"] = 0.0
 
-            # 用當日（或最後一日用 latest）價格與匯率算權益
             total_mv_twd = 0.0
             for tkr, p in pos.items():
                 if p["shares"] <= 0:
                     continue
                 ccy = p["currency"]
-                if day == last_day:
+                if day == last_day_local:
                     px_today = latest_prices.get(tkr, np.nan)
                     if np.isnan(px_today):
                         px_today = float(stock_close_daily.get(tkr, pd.Series(index=all_dates)).get(day, np.nan))
@@ -848,16 +881,16 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
     }
 
     # =====================================================
-    # ＊比較分析（鏡像 + DCA）：動態標的（mirror_list / dca_list），可調 DCA 金額與扣款日
+    # 比較分析（鏡像 + DCA + Lump Sum）
     # =====================================================
     comparison_results = []
     compare_sheets = {}
     comparison_trade_sets = []  # (label, df_trades_like) 用於日權益曲線
 
-    # 預設標的（若使用者未選擇）
     default_targets = ["SPY", "0050.TW", "2330.TW"]
     mirror_targets = mirror_list if mirror_list else default_targets
     dca_targets    = dca_list if dca_list else default_targets
+    lumpsum_targets= lumpsum_list if lumpsum_list else default_targets
 
     def _evaluate_portfolio_fast(df_trades_like):
         pos = {}
@@ -925,7 +958,7 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         }
         return position_df_alt, realized, summary_alt
 
-    # 鏡像（依勾選）
+    # 鏡像
     for tgt in mirror_targets:
         df_m = make_mirror_trades(df_trades, tgt, fx_data_dict, stock_data_dict, min_date, max_date)
         if df_m.empty:
@@ -938,11 +971,9 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         compare_sheets[f"鏡像_{name}_買賣明細"] = disp_m
         compare_sheets[f"鏡像_{name}_庫存摘要"] = pos_m
         r = {"策略": f"鏡像-{name}"}; r.update(sum_m); comparison_results.append(r)
-
-        # 供日權益曲線使用
         comparison_trade_sets.append((f"鏡像-{name}", df_m))
 
-    # DCA（依勾選）
+    # DCA
     for tgt in dca_targets:
         df_d = make_monthly_dca_trades(min_date, max_date, dca_amount_twd, tgt, fx_data_dict, stock_data_dict, dca_day=dca_day)
         if df_d.empty:
@@ -955,9 +986,22 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         compare_sheets[f"DCA_{name}_買賣明細"] = disp_d
         compare_sheets[f"DCA_{name}_庫存摘要"] = pos_d
         r = {"策略": f"DCA-{name}"}; r.update(sum_d); comparison_results.append(r)
-
-        # 供日權益曲線使用
         comparison_trade_sets.append((f"DCA-{name}", df_d))
+
+    # Lump Sum（由投資預算總水位的上升量驅動）
+    for tgt in lumpsum_targets:
+        df_l = make_lumpsum_trades_from_budget(df, tgt, fx_data_dict, stock_data_dict, min_date, max_date)
+        if df_l.empty:
+            continue
+        pos_l, _, sum_l = _evaluate_portfolio_fast(df_l)
+        disp_l = df_l.copy().sort_values("日期")
+        disp_l["歷史匯率"] = disp_l["換匯匯率"]
+        disp_l = disp_l[["日期","股票代號","幣別","購買股數","購買股價","換匯匯率","歷史匯率","交易成本"]]
+        name = tgt.replace(".TW","").replace(".T","")
+        compare_sheets[f"LumpSum_{name}_買賣明細"] = disp_l
+        compare_sheets[f"LumpSum_{name}_庫存摘要"] = pos_l
+        r = {"策略": f"LumpSum-{name}"}; r.update(sum_l); comparison_results.append(r)
+        comparison_trade_sets.append((f"LumpSum-{name}", df_l))
 
     # 原投組 summary 放第一列
     base_summary = {
@@ -970,8 +1014,7 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         "報酬率": ( (total_unreal + total_realized) / total_twd_cost ) if total_twd_cost>0 else np.nan
     }
 
-    # === (修正) 補齊比較標的的歷史價與匯率到日頻序列 ===
-    # 1) 收集比較用標的與幣別
+    # === 補齊比較標的歷史價與匯率到日頻序列 ===
     extra_tickers = set()
     extra_ccys = set()
     for label, df_like in comparison_trade_sets:
@@ -983,14 +1026,12 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         else:
             extra_ccys.update([determine_currency(t) for t in df_like["股票代號"].dropna().unique().tolist()])
 
-    # 2) 下載尚未存在於 stock_data_dict 的標的歷史價
     for tkr in sorted(extra_tickers):
         if tkr not in stock_data_dict or stock_data_dict[tkr] is None or stock_data_dict[tkr].empty:
             s = download_stock_history(tkr, min_date, max_date)
             if not s.empty:
                 stock_data_dict[tkr] = s
 
-    # 3) 下載尚未存在於 fx_data_dict 的幣別歷史匯率
     for cur in sorted(extra_ccys):
         if cur == "TWD":
             continue
@@ -999,7 +1040,6 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
             if not f.empty:
                 fx_data_dict[cur] = f
 
-    # 4) 重新/增量建立 stock_close_daily（把新標的也轉成日頻並前填）
     for tkr, sdf in stock_data_dict.items():
         if sdf is None or sdf.empty:
             continue
@@ -1008,7 +1048,6 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
             ser.index = pd.to_datetime(ser.index).normalize()
             stock_close_daily[tkr] = ser.reindex(all_dates).ffill()
 
-    # 5) 重新/增量建立 fx_daily（把新幣別也轉成日頻並前填）
     fx_daily.setdefault("TWD", pd.Series(1.0, index=all_dates))
     for cur, fdf in fx_data_dict.items():
         if fdf is None or fdf.empty:
@@ -1018,7 +1057,6 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
             ser.index = pd.to_datetime(ser.index).normalize()
             fx_daily[cur] = ser.reindex(all_dates).ffill()
 
-    # 6) 補齊比較標的的 latest_prices（最後一天顯示用）
     for tkr in extra_tickers:
         if tkr not in latest_prices or np.isnan(latest_prices.get(tkr, np.nan)):
             try:
@@ -1028,7 +1066,7 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
             except Exception:
                 pass
 
-    # === (新增) 曲線彙整（寬表/長表）：你的投組 + 各策略日權益 ===
+    # === 權益曲線彙整 ===
     base_curve = daily_portfolio_df[["日期", "投組總額_日報"]].rename(columns={"投組總額_日報": "你的投組(平均成本法)"})
     comparison_equity_wide = base_curve.copy()
     for label, df_like in comparison_trade_sets:
@@ -1061,10 +1099,10 @@ st.divider()
 col1, col2 = st.columns([2,1])
 with col1:
     compare_choices = st.multiselect(
-        "選擇比較標的（鏡像 + DCA）",
+        "選擇比較標的（鏡像 + DCA + Lump Sum）",
         options=["SPY", "0050.TW", "2330.TW"],
         default=["SPY", "0050.TW", "2330.TW"],
-        help="鏡像與 DCA 都會使用這些標的。你可只選部分。"
+        help="三種策略都會使用這些標的。你可只選部分。"
     )
 with col2:
     dca_day = st.number_input("DCA 扣款日（每月）", min_value=1, max_value=28, value=1, step=1)
@@ -1083,7 +1121,8 @@ if st.button("Run Analysis", type="primary", use_container_width=True):
                 dca_amount_twd=dca_amount_twd,
                 mirror_list=compare_choices,
                 dca_list=compare_choices,
-                dca_day=dca_day
+                dca_day=dca_day,
+                lumpsum_list=compare_choices  # ★ 新增：Lump Sum 也用同一組標的
             )
             st.session_state["analysis_result"] = result
             st.success("Done!")
@@ -1096,7 +1135,6 @@ if result:
     dfs = result.get("dataframes", {})
     figs= result.get("figures", {})
 
-    # 下載整包報表
     st.download_button(
         "Download Excel Report",
         data=result.get("report_bytes"),
@@ -1157,7 +1195,7 @@ if result:
 
     if "comparison_overview" in dfs:
         with tabs[-1]:
-            st.subheader("六組策略 vs 你的投組（概覽）")
+            st.subheader("多策略 vs 你的投組（概覽）")
             st.dataframe(dfs["comparison_overview"], use_container_width=True)
             st.download_button(
                 "comparison_overview.csv",
@@ -1174,14 +1212,13 @@ if result:
 
             if eq_wide is not None and not eq_wide.empty and eq_long is not None and not eq_long.empty:
                 all_series = [c for c in eq_wide.columns if c != "日期"]
-                # 預設顯示：你的投組 + 第一個策略（若有）
                 default_series = ["你的投組(平均成本法)"] + ([s for s in all_series if s != "你的投組(平均成本法)"][:1])
 
                 picked = st.multiselect(
                     "選擇要顯示的曲線",
                     options=all_series,
                     default=default_series,
-                    help="可多選。左列會一起畫在同一張圖上。"
+                    help="可多選。"
                 )
 
                 if picked:
@@ -1201,7 +1238,6 @@ if result:
                             eq_wide[["日期"] + picked],
                             use_container_width=True
                         )
-                    # 下載曲線資料
                     st.download_button(
                         "comparison_equity_wide.csv",
                         eq_wide.to_csv(index=False).encode("utf-8-sig"),
@@ -1213,3 +1249,4 @@ if result:
                     st.warning("請至少勾選一條曲線顯示。")
             else:
                 st.info("尚無可用的曲線資料。請先執行分析並選擇比較標的。")
+
