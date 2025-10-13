@@ -181,12 +181,7 @@ class StockEventProcessor:
 
 # ========= 修正警告：單一元素 Series 取值工具 =========
 def _series_value_at(ser: pd.Series, key, default=np.nan):
-    """
-    安全取得 Series 在 key 的單一值：
-    - 若不存在回傳 default
-    - 若回傳的是 Series（重複 index），取最後一筆
-    - 永遠回傳純標量（不再用 float() 包著 Series）
-    """
+    """安全取得 Series[key] 的純量值；若無則 default。"""
     if ser is None or len(ser) == 0:
         return default
     try:
@@ -692,6 +687,8 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
 
         unreal_total_twd = total_mv_twd - total_cost_twd
         unreal_fx_twd    = unreal_total_twd - unreal_invest_twd
+
+        # ✅ 修正：避免 float(Series) 的 FutureWarning
         _cash = _series_value_at(cash_by_day, day, 0.0)
         cash_twd = float(_cash) if not pd.isna(_cash) else 0.0
 
