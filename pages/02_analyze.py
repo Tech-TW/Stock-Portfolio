@@ -692,7 +692,9 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
 
         unreal_total_twd = total_mv_twd - total_cost_twd
         unreal_fx_twd    = unreal_total_twd - unreal_invest_twd
-        cash_twd = float(cash_by_day.get(day, 0.0))
+        _cash = _series_value_at(cash_by_day, day, 0.0)
+        cash_twd = float(_cash) if not pd.isna(_cash) else 0.0
+
         total_equity_twd = cum_realized_twd + total_mv_twd
         total_current_assets_twd = total_equity_twd + cash_twd
 
