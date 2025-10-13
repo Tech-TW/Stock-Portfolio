@@ -970,6 +970,64 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         "報酬率": ( (total_unreal + total_realized) / total_twd_cost ) if total_twd_cost>0 else np.nan
     }
 
+    # === (修正) 補齊比較標的的歷史價與匯率到日頻序列 ===
+    # 1) 收集比較用標的與幣別
+    extra_tickers = set()
+    extra_ccys = set()
+    for label, df_like in comparison_trade_sets:
+        if df_like is None or df_like.empty:
+            continue
+        extra_tickers.update(df_like["股票代號"].dropna().unique().tolist())
+        if "幣別" in df_like.columns:
+            extra_ccys.update(df_like["幣別"].dropna().unique().tolist())
+        else:
+            extra_ccys.update([determine_currency(t) for t in df_like["股票代號"].dropna().unique().tolist()])
+
+    # 2) 下載尚未存在於 stock_data_dict 的標的歷史價
+    for tkr in sorted(extra_tickers):
+        if tkr not in stock_data_dict or stock_data_dict[tkr] is None or stock_data_dict[tkr].empty:
+            s = download_stock_history(tkr, min_date, max_date)
+            if not s.empty:
+                stock_data_dict[tkr] = s
+
+    # 3) 下載尚未存在於 fx_data_dict 的幣別歷史匯率
+    for cur in sorted(extra_ccys):
+        if cur == "TWD":
+            continue
+        if cur not in fx_data_dict or fx_data_dict[cur] is None or fx_data_dict[cur].empty:
+            f = download_fx_history(cur, min_date, max_date)
+            if not f.empty:
+                fx_data_dict[cur] = f
+
+    # 4) 重新/增量建立 stock_close_daily（把新標的也轉成日頻並前填）
+    for tkr, sdf in stock_data_dict.items():
+        if sdf is None or sdf.empty:
+            continue
+        if tkr not in stock_close_daily:
+            ser = sdf.set_index("日期")["收盤價"].sort_index()
+            ser.index = pd.to_datetime(ser.index).normalize()
+            stock_close_daily[tkr] = ser.reindex(all_dates).ffill()
+
+    # 5) 重新/增量建立 fx_daily（把新幣別也轉成日頻並前填）
+    fx_daily.setdefault("TWD", pd.Series(1.0, index=all_dates))
+    for cur, fdf in fx_data_dict.items():
+        if fdf is None or fdf.empty:
+            continue
+        if cur not in fx_daily:
+            ser = fdf.set_index("日期")["匯率"].sort_index()
+            ser.index = pd.to_datetime(ser.index).normalize()
+            fx_daily[cur] = ser.reindex(all_dates).ffill()
+
+    # 6) 補齊比較標的的 latest_prices（最後一天顯示用）
+    for tkr in extra_tickers:
+        if tkr not in latest_prices or np.isnan(latest_prices.get(tkr, np.nan)):
+            try:
+                data = yf.download(tkr, period="5d", interval="1d", auto_adjust=True, progress=False)
+                if not data.empty:
+                    latest_prices[tkr] = float(data["Close"].dropna().iloc[-1])
+            except Exception:
+                pass
+
     # === (新增) 曲線彙整（寬表/長表）：你的投組 + 各策略日權益 ===
     base_curve = daily_portfolio_df[["日期", "投組總額_日報"]].rename(columns={"投組總額_日報": "你的投組(平均成本法)"})
     comparison_equity_wide = base_curve.copy()
