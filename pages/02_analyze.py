@@ -1,6 +1,6 @@
 # ──────────────────────────────────────────────────────────
 # 檔案：pages/02_🚀_執行分析.py
-# 說明：執行分析、分頁顯示、下載報表（含：鏡像、DCA、Lump Sum 比較分析 + 估值日切換）
+# 說明：執行分析、分頁顯示、下載報表（鏡像 / DCA / Lump Sum 比較 + 估值日切換）
 # ──────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -37,12 +37,12 @@ def determine_currency(ticker: str) -> str:
     t = str(ticker).upper()
     if t.endswith(".TW") or t.endswith(".TWO"): return "TWD"
     if t.isdigit() and len(t) == 4:            return "TWD"
-    if t.endswith(".HK"):                       return "HKD"
-    if t.endswith(".T"):                        return "JPY"
-    if t.endswith(".L"):                        return "GBP"
-    if t.endswith(".DE") or t.endswith(".F"):   return "EUR"
-    if t.endswith(".TO"):                       return "CAD"
-    if t.endswith(".AX"):                       return "AUD"
+    if t.endswith(".HK"):                      return "HKD"
+    if t.endswith(".T"):                       return "JPY"
+    if t.endswith(".L"):                       return "GBP"
+    if t.endswith(".DE") or t.endswith(".F"):  return "EUR"
+    if t.endswith(".TO"):                      return "CAD"
+    if t.endswith(".AX"):                      return "AUD"
     return "USD"
 
 def download_fx_history(currency: str, start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
@@ -178,6 +178,27 @@ class StockEventProcessor:
             r = self.apply_stock_split_with_timing(position_data, ticker, sp["date"], sp["ratio"], transaction_history)
             if r: out.append(r)
         return out
+
+# ========= 修正警告：單一元素 Series 取值工具 =========
+def _series_value_at(ser: pd.Series, key, default=np.nan):
+    """
+    安全取得 Series 在 key 的單一值：
+    - 若不存在回傳 default
+    - 若回傳的是 Series（重複 index），取最後一筆
+    - 永遠回傳純標量（不再用 float() 包著 Series）
+    """
+    if ser is None or len(ser) == 0:
+        return default
+    try:
+        if key in ser.index:
+            v = ser.loc[key]
+        else:
+            v = ser.get(key, default)
+    except Exception:
+        v = default
+    if isinstance(v, pd.Series):
+        v = v.iloc[-1] if len(v) else default
+    return v
 
 # ========= FIFO（修正版，含交易成本） =========
 def build_fifo_inventory_with_cost_fixed(df_trades, fx_data_dict, latest_prices=None):
@@ -345,15 +366,10 @@ def make_monthly_dca_trades(start_date, end_date, amount_twd, target_ticker, fx_
         if col not in df_dca.columns: df_dca[col] = np.nan
     return df_dca
 
-# === 新增：Lump Sum（由「投資預算總水位」的上升量驅動一次性投入） ===
+# === Lump Sum：由『投資預算總水位』的上升量一次性投入 ===
 def make_lumpsum_trades_from_budget(df_all: pd.DataFrame, target_ticker: str,
                                     fx_data_dict: dict, stock_data_dict: dict,
                                     start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
-    """
-    從 df_all 中的『投資預算總水位』偵測上升量（含第一日由0起算），
-    每次上升金額在當日一次性買入 target_ticker。
-    僅取 start_date ~ end_date 內的紀錄，與估值日對齊。
-    """
     if "投資預算總水位" not in df_all.columns or "日期" not in df_all.columns:
         return pd.DataFrame(columns=["日期","股票代號","購買股數","購買股價","換匯匯率","交易成本","幣別"])
 
@@ -576,7 +592,6 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
     # === 10) 投組每日總彙整（到估值日） ===
     all_dates = pd.date_range(min_date, end_of_range, freq="D")
 
-    # 先準備日收盤與日匯率序列
     stock_close_daily = {}
     for tkr, sdf in stock_data_dict.items():
         if sdf is None or sdf.empty: continue
@@ -661,16 +676,19 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
             if day==last_day:
                 px_today = latest_prices.get(tkr, np.nan)
                 if np.isnan(px_today):
-                    px_today = float(stock_close_daily.get(tkr, pd.Series(index=all_dates)).get(day, np.nan))
+                    ser = stock_close_daily.get(tkr, pd.Series(index=all_dates))
+                    px_today = _series_value_at(ser, day, np.nan)
                 fx_today = _latest_fx_safe(ccy)
             else:
-                px_today = float(stock_close_daily.get(tkr, pd.Series(index=all_dates)).get(day, np.nan))
-                fx_today = float(fx_daily.get(ccy, pd.Series(index=all_dates)).get(day, np.nan))
+                ser = stock_close_daily.get(tkr, pd.Series(index=all_dates))
+                px_today = _series_value_at(ser, day, np.nan)
+                ser_fx = fx_daily.get(ccy, pd.Series(index=all_dates))
+                fx_today = _series_value_at(ser_fx, day, np.nan)
             if np.isnan(px_today) or np.isnan(fx_today): continue
-            mv_twd = px_today * p["shares"] * fx_today
+            mv_twd = float(px_today) * p["shares"] * float(fx_today)
             total_mv_twd += mv_twd
             total_cost_twd += p["total_cost_twd"]
-            unreal_invest_twd += (px_today - p["avg_cost_foreign"]) * p["shares"] * fx_today
+            unreal_invest_twd += (float(px_today) - p["avg_cost_foreign"]) * p["shares"] * float(fx_today)
 
         unreal_total_twd = total_mv_twd - total_cost_twd
         unreal_fx_twd    = unreal_total_twd - unreal_invest_twd
@@ -692,7 +710,7 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         })
     daily_portfolio_df = pd.DataFrame(daily_rows).rename(columns={"總權益(台幣)":"投組總額_日報"})
 
-    # === (新增) 比較策略：每日權益曲線產生器 ===
+    # === 比較策略：每日權益曲線產生器 ===
     def _equity_curve_for_trades(df_trades_like: pd.DataFrame, label: str) -> pd.DataFrame:
         if df_trades_like is None or df_trades_like.empty:
             return pd.DataFrame(columns=["日期", label])
@@ -710,7 +728,6 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         like_by_day = {d: g for d, g in df_like.sort_values("日期").groupby("日期")}
         last_day_local = daily_portfolio_df["日期"].iloc[-1]
 
-        # 用同樣的價格/匯率邏輯估算每日權益
         for day in daily_portfolio_df["日期"].tolist():
             if day in like_by_day:
                 for _, r in like_by_day[day].iterrows():
@@ -739,7 +756,7 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
                             p["total_cost_twd"] = 0.0
                     else:
                         sell = abs(sh)
-                        if p["shares"] <= 0 or p["shares"] < sell: 
+                        if p["shares"] <= 0 or p["shares"] < sell:
                             continue
                         gross = px * sell
                         net   = gross - fee
@@ -762,14 +779,17 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
                 if day == last_day_local:
                     px_today = latest_prices.get(tkr, np.nan)
                     if np.isnan(px_today):
-                        px_today = float(stock_close_daily.get(tkr, pd.Series(index=daily_portfolio_df["日期"])).get(day, np.nan))
+                        ser = stock_close_daily.get(tkr, pd.Series(index=daily_portfolio_df["日期"]))
+                        px_today = _series_value_at(ser, day, np.nan)
                     fx_today = _latest_fx_safe(ccy)
                 else:
-                    px_today = float(stock_close_daily.get(tkr, pd.Series(index=daily_portfolio_df["日期"])).get(day, np.nan))
-                    fx_today = float(fx_daily.get(ccy, pd.Series(index=daily_portfolio_df["日期"])).get(day, np.nan))
+                    ser = stock_close_daily.get(tkr, pd.Series(index=daily_portfolio_df["日期"]))
+                    px_today = _series_value_at(ser, day, np.nan)
+                    ser_fx = fx_daily.get(ccy, pd.Series(index=daily_portfolio_df["日期"]))
+                    fx_today = _series_value_at(ser_fx, day, np.nan)
                 if np.isnan(px_today) or np.isnan(fx_today):
                     continue
-                total_mv_twd += px_today * p["shares"] * fx_today
+                total_mv_twd += float(px_today) * p["shares"] * float(fx_today)
 
             total_equity_twd = total_mv_twd + cum_realized_twd
             rows.append({"日期": day, label: round(total_equity_twd, 0)})
@@ -812,14 +832,13 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
     # =====================================================
     comparison_results = []
     compare_sheets = {}
-    comparison_trade_sets = []  # (label, df_trades_like) 用於日權益曲線
+    comparison_trade_sets = []  # (label, df_trades_like)
 
     default_targets = ["SPY", "0050.TW", "2330.TW"]
     mirror_targets = mirror_list if mirror_list else default_targets
     dca_targets    = dca_list if dca_list else default_targets
     lumpsum_targets= lumpsum_list if lumpsum_list else default_targets
 
-    # 供快照估值用（與曲線一致）
     def _evaluate_portfolio_fast(df_trades_like: pd.DataFrame):
         if df_trades_like is None or df_trades_like.empty:
             return pd.DataFrame(), {}, {"總成本(台幣)":0.0,"市值(台幣)":0.0,"未實現損益(台幣)":0.0,"已實現損益(台幣)":0.0,"總損益(台幣)":0.0,"報酬率":np.nan}
@@ -865,21 +884,20 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
             if p["shares"]<=0: continue
             px_today = latest_prices.get(tkr, np.nan)
             if np.isnan(px_today):
-                px_today = float(stock_close_daily.get(tkr, pd.Series(index=daily_portfolio_df["日期"])).get(valuation_day_local, np.nan))
-            fx_today = get_latest_fx_rate(p["currency"], fx_data_dict)
-            if np.isnan(fx_today):
-                tmp = fx_daily.get(p["currency"])
-                fx_today = float(tmp.iloc[-1]) if tmp is not None and len(tmp) else (1.0 if p["currency"]=="TWD" else np.nan)
+                ser = stock_close_daily.get(tkr, pd.Series(index=daily_portfolio_df["日期"]))
+                px_today = _series_value_at(ser, valuation_day_local, np.nan)
+            ser_fx = fx_daily.get(p["currency"])
+            fx_today = _series_value_at(ser_fx, valuation_day_local, (1.0 if p["currency"]=="TWD" else np.nan))
             if np.isnan(px_today) or np.isnan(fx_today): 
                 continue
-            mv_twd = px_today * p["shares"] * fx_today
-            unreal_invest_twd = (px_today - p["avg_cost_foreign"]) * p["shares"] * fx_today
+            mv_twd = float(px_today) * p["shares"] * float(fx_today)
+            unreal_invest_twd = (float(px_today) - p["avg_cost_foreign"]) * p["shares"] * float(fx_today)
             unreal_total_twd  = mv_twd - p["total_cost_twd"]
             rows.append({
                 "股票代號": tkr, "幣別": p["currency"], "持有股數": p["shares"],
                 "平均成本(原幣)": p["avg_cost_foreign"], "平均匯率成本": p["avg_fx"],
-                "總成本(台幣)": p["total_cost_twd"], "現價(原幣)": px_today,
-                "最新匯率": fx_today, "市值(台幣)": mv_twd,
+                "總成本(台幣)": p["total_cost_twd"], "現價(原幣)": float(px_today),
+                "最新匯率": float(fx_today), "市值(台幣)": mv_twd,
                 "未實現投資損益(台幣)": unreal_invest_twd, "未實現總損益(台幣)": unreal_total_twd,
                 "未實現投資匯率損益(台幣)": unreal_total_twd - unreal_invest_twd
             })
@@ -912,7 +930,7 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         r = {"策略": f"鏡像-{name}"}; r.update(sum_m); comparison_results.append(r)
         comparison_trade_sets.append((f"鏡像-{name}", df_m))
 
-    # DCA（投到估值日）
+    # DCA
     for tgt in dca_targets:
         df_d = make_monthly_dca_trades(min_date, end_of_range, dca_amount_twd, tgt, fx_data_dict, stock_data_dict, dca_day=dca_day)
         if df_d.empty:
@@ -927,7 +945,7 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         r = {"策略": f"DCA-{name}"}; r.update(sum_d); comparison_results.append(r)
         comparison_trade_sets.append((f"DCA-{name}", df_d))
 
-    # Lump Sum（依投資預算總水位上升量；投到估值日）
+    # Lump Sum
     for tgt in lumpsum_targets:
         df_l = make_lumpsum_trades_from_budget(df, tgt, fx_data_dict, stock_data_dict,
                                                start_date=min_date, end_date=end_of_range)
@@ -943,15 +961,17 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         r = {"策略": f"LumpSum-{name}"}; r.update(sum_l); comparison_results.append(r)
         comparison_trade_sets.append((f"LumpSum-{name}", df_l))
 
-    # 原投組 summary 放第一列（估值以 end_of_range）
+    # 原投組 summary 放第一列
     base_summary = {
         "策略": "你的投組(平均成本法)",
         "總成本(台幣)": float(position_df["總成本(台幣)"].sum()) if not position_df.empty else 0.0,
         "市值(台幣)": float(position_df["市值(台幣)"].sum()) if not position_df.empty else 0.0,
         "未實現損益(台幣)": float(position_df["未實現總損益(台幣)"].sum()) if not position_df.empty else 0.0,
         "已實現損益(台幣)": float(realized_df["已實現總損益(台幣)"].sum()) if not realized_df.empty else 0.0,
-        "總損益(台幣)": (float(position_df["未實現總損益(台幣)"].sum()) if not position_df.empty else 0.0) +
-                    (float(realized_df["已實現總損益(台幣)"].sum()) if not realized_df.empty else 0.0),
+        "總損益(台幣)": (
+            (float(position_df["未實現總損益(台幣)"].sum()) if not position_df.empty else 0.0) +
+            (float(realized_df["已實現總損益(台幣)"].sum()) if not realized_df.empty else 0.0)
+        ),
         "報酬率": (
             (
                 (float(position_df["未實現總損益(台幣)"].sum()) if not position_df.empty else 0.0) +
@@ -960,7 +980,7 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         ) if (not position_df.empty and float(position_df["總成本(台幣)"].sum())>0) else np.nan
     }
 
-    # === 補齊比較標的歷史價與匯率到日頻序列（for 曲線） ===
+    # 補齊比較用歷史價＆匯率序列
     extra_tickers = set()
     extra_ccys = set()
     for _, df_like in comparison_trade_sets:
@@ -1000,7 +1020,7 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
             except Exception:
                 pass
 
-    # === 權益曲線彙整 ===
+    # 權益曲線彙整
     base_curve = daily_portfolio_df[["日期", "投組總額_日報"]].rename(columns={"投組總額_日報": "你的投組(平均成本法)"})
     comparison_equity_wide = base_curve.copy()
     for label, df_like in comparison_trade_sets:
@@ -1021,12 +1041,11 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         for k, v in compare_sheets.items():
             dataframes[k] = v
 
-    # 把估值日資訊帶回 UI 使用
     return {
-        "meta":{"start":min_date,"end":max_date,"records":len(df_trades),"valuation_day":valuation_day,"valuation_to_today":valuation_to_today},
+        "meta":{"start":min_date,"end":max_date,"records":len(df_trades),
+                "valuation_day":valuation_day,"valuation_to_today":valuation_to_today},
         "dataframes": dataframes,
-        "figures": {"equity_curve": fig_equity}
-        ,
+        "figures": {"equity_curve": fig_equity},
         "report_bytes": make_excel_report(dataframes)
     }
 
@@ -1057,7 +1076,7 @@ dca_amount_twd = st.number_input(
 )
 
 # ====== Run ======
-if st.button("Run Analysis", type="primary", use_container_width=True):
+if st.button("Run Analysis", type="primary", width='stretch'):
     with st.status("Running analysis...", expanded=False):
         try:
             result = run_full_analysis(
@@ -1082,12 +1101,13 @@ if result:
     meta= result.get("meta", {})
     vday = meta.get("valuation_day")
 
+    # 下載整包報表
     st.download_button(
         "Download Excel Report",
         data=result.get("report_bytes"),
         file_name=f"portfolio_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True
+        width='stretch'
     )
 
     tab_names = [
@@ -1101,56 +1121,64 @@ if result:
 
     with tabs[0]:
         st.subheader("Summary")
-        st.dataframe(dfs["summary"], use_container_width=True)
+        st.dataframe(dfs["summary"], width='stretch')
 
     with tabs[1]:
         st.subheader("Trades")
-        st.dataframe(dfs["trades"], use_container_width=True)
-        st.download_button("trades.csv", dfs["trades"].to_csv(index=False).encode("utf-8-sig"), "trades.csv", "text/csv")
+        st.dataframe(dfs["trades"], width='stretch')
+        st.download_button("trades.csv", dfs["trades"].to_csv(index=False).encode("utf-8-sig"),
+                           "trades.csv", "text/csv", width='content')
 
     with tabs[2]:
         st.subheader("Positions (Avg)")
-        st.dataframe(dfs["positions_avg"], use_container_width=True)
-        st.download_button("positions_avg.csv", dfs["positions_avg"].to_csv(index=False).encode("utf-8-sig"), "positions_avg.csv", "text/csv")
+        st.dataframe(dfs["positions_avg"], width='stretch')
+        st.download_button("positions_avg.csv", dfs["positions_avg"].to_csv(index=False).encode("utf-8-sig"),
+                           "positions_avg.csv", "text/csv", width='content')
 
     with tabs[3]:
         st.subheader("Positions (FIFO)")
-        st.dataframe(dfs["positions_fifo"], use_container_width=True)
-        st.download_button("positions_fifo.csv", dfs["positions_fifo"].to_csv(index=False).encode("utf-8-sig"), "positions_fifo.csv", "text/csv")
+        st.dataframe(dfs["positions_fifo"], width='stretch')
+        st.download_button("positions_fifo.csv", dfs["positions_fifo"].to_csv(index=False).encode("utf-8-sig"),
+                           "positions_fifo.csv", "text/csv", width='content')
 
     with tabs[4]:
         st.subheader("Realized P/L")
-        st.dataframe(dfs["realized"], use_container_width=True)
-        st.download_button("realized.csv", dfs["realized"].to_csv(index=False).encode("utf-8-sig"), "realized.csv", "text/csv")
+        st.dataframe(dfs["realized"], width='stretch')
+        st.download_button("realized.csv", dfs["realized"].to_csv(index=False).encode("utf-8-sig"),
+                           "realized.csv", "text/csv", width='content')
 
     with tabs[5]:
         st.subheader("Costs")
-        st.dataframe(dfs["costs"], use_container_width=True)
-        st.download_button("costs.csv", dfs["costs"].to_csv(index=False).encode("utf-8-sig"), "costs.csv", "text/csv")
+        st.dataframe(dfs["costs"], width='stretch')
+        st.download_button("costs.csv", dfs["costs"].to_csv(index=False).encode("utf-8-sig"),
+                           "costs.csv", "text/csv", width='content')
 
     with tabs[6]:
         st.subheader("Daily Equity / NAV Curve")
         st.caption(f"估值日：{vday.date() if vday is not None else '—'}")
-        st.dataframe(dfs["daily_equity"], use_container_width=True)
+        st.dataframe(dfs["daily_equity"], width='stretch')
         if figs.get("equity_curve") is not None:
-            st.plotly_chart(figs["equity_curve"], use_container_width=True)
-        st.download_button("daily_equity.csv", dfs["daily_equity"].to_csv(index=False).encode("utf-8-sig"), "daily_equity.csv", "text/csv")
+            st.plotly_chart(figs["equity_curve"], width='stretch')
+        st.download_button("daily_equity.csv", dfs["daily_equity"].to_csv(index=False).encode("utf-8-sig"),
+                           "daily_equity.csv", "text/csv", width='content')
 
     with tabs[7]:
         st.subheader("Detail (Buy/Sell) with P/L Columns")
-        st.dataframe(dfs["display_detail"], use_container_width=True)
-        st.download_button("display_detail.csv", dfs["display_detail"].to_csv(index=False).encode("utf-8-sig"), "display_detail.csv", "text/csv")
+        st.dataframe(dfs["display_detail"], width='stretch')
+        st.download_button("display_detail.csv", dfs["display_detail"].to_csv(index=False).encode("utf-8-sig"),
+                           "display_detail.csv", "text/csv", width='content')
 
     if "comparison_overview" in dfs:
         with tabs[-1]:
             st.subheader("多策略 vs 你的投組（概覽）")
             st.caption(f"估值日：{vday.date() if vday is not None else '—'}（與圖表一致）")
-            st.dataframe(dfs["comparison_overview"], use_container_width=True)
+            st.dataframe(dfs["comparison_overview"], width='stretch')
             st.download_button(
                 "comparison_overview.csv",
                 dfs["comparison_overview"].to_csv(index=False).encode("utf-8-sig"),
                 "comparison_overview.csv",
-                "text/csv"
+                "text/csv",
+                width='content'
             )
 
             st.markdown("---")
@@ -1180,19 +1208,20 @@ if result:
                             title="策略權益曲線比較（台幣）"
                         )
                         fig_cmp.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-                        st.plotly_chart(fig_cmp, use_container_width=True)
+                        st.plotly_chart(fig_cmp, width='stretch')
                     except Exception:
                         st.info("Plotly 無法載入，改以表格呈現。")
-                        st.dataframe(eq_wide[["日期"] + picked], use_container_width=True)
+                        st.dataframe(eq_wide[["日期"] + picked], width='stretch')
 
                     st.download_button(
                         "comparison_equity_wide.csv",
                         eq_wide.to_csv(index=False).encode("utf-8-sig"),
                         "comparison_equity_wide.csv",
                         "text/csv",
-                        use_container_width=True
+                        width='content'
                     )
                 else:
                     st.warning("請至少勾選一條曲線顯示。")
             else:
                 st.info("尚無可用的曲線資料。請先執行分析並選擇比較標的。")
+
