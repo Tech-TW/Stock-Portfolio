@@ -724,6 +724,103 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         })
     daily_portfolio_df = pd.DataFrame(daily_rows).rename(columns={"總權益(台幣)":"投組總額_日報"})
 
+     # === (新增) 比較策略：每日權益曲線產生器 ===
+    def _equity_curve_for_trades(df_trades_like: pd.DataFrame, label: str) -> pd.DataFrame:
+        """
+        用既有 all_dates / stock_close_daily / fx_daily 模擬該組交易的每日權益（市值 + 累計已實現）。
+        不含現金（視為 0）。
+        回傳欄位：['日期', label]
+        """
+        if df_trades_like is None or df_trades_like.empty:
+            return pd.DataFrame(columns=["日期", label])
+
+        pos = {}  # tkr -> {shares, avg_cost_foreign, avg_fx, total_cost_twd, currency}
+        cum_realized_twd = 0.0
+        rows = []
+
+        # 須確保必要欄位
+        df_like = df_trades_like.copy()
+        df_like["日期"] = pd.to_datetime(df_like["日期"]).dt.normalize()
+        df_like["交易成本"] = pd.to_numeric(df_like.get("交易成本", 0.0), errors="coerce").fillna(0.0)
+        df_like["換匯匯率"] = pd.to_numeric(df_like.get("換匯匯率", 1.0), errors="coerce").fillna(1.0)
+        df_like["幣別"] = df_like.get("幣別", df_like["股票代號"].apply(determine_currency))
+
+        like_by_day = {d: g for d, g in df_like.sort_values("日期").groupby("日期")}
+
+        for day in all_dates:
+            # 先把今天的交易過帳
+            if day in like_by_day:
+                for _, r in like_by_day[day].iterrows():
+                    tkr = r["股票代號"]; sh = float(r["購買股數"]); px = float(r["購買股價"])
+                    fx  = float(r.get("換匯匯率", 1.0)); fee = float(r.get("交易成本", 0.0))
+                    ccy = r.get("幣別", determine_currency(tkr))
+
+                    if tkr not in pos:
+                        pos[tkr] = {"shares":0.0, "avg_cost_foreign":0.0, "avg_fx":1.0,
+                                    "total_cost_twd":0.0, "currency":ccy}
+
+                    p = pos[tkr]
+                    if sh > 0:
+                        # 買入：把手續費攤入成本
+                        actual = (px * sh + fee) / sh
+                        new_sh = p["shares"] + sh
+                        new_cf = p["avg_cost_foreign"] * p["shares"] + actual * sh
+                        # 換匯以當下單列（與你的主流程一致）
+                        new_ct = p["total_cost_twd"] + actual * sh * fx
+
+                        p["shares"] = new_sh
+                        if new_sh > 0:
+                            p["avg_cost_foreign"] = new_cf / new_sh
+                            p["avg_fx"]           = (new_ct / new_cf) if new_cf > 0 else 1.0
+                            p["total_cost_twd"]   = p["avg_cost_foreign"] * p["shares"] * p["avg_fx"]
+                        else:
+                            p["avg_cost_foreign"] = 0.0
+                            p["avg_fx"] = 1.0
+                            p["total_cost_twd"] = 0.0
+                    else:
+                        # 賣出：以平均成本法估基礎
+                        sell = abs(sh)
+                        if p["shares"] <= 0 or p["shares"] < sell:
+                            continue
+                        gross = px * sell
+                        net   = gross - fee
+                        # 全部用 avg_fx 兌回 TWD（與主流程一致）
+                        real_f = (net / sell - p["avg_cost_foreign"]) * sell
+                        real_t = real_f * p["avg_fx"]
+                        cum_realized_twd += real_t
+
+                        p["shares"] -= sell
+                        if p["shares"] > 0:
+                            p["total_cost_twd"] = p["avg_cost_foreign"] * p["shares"] * p["avg_fx"]
+                        else:
+                            p["avg_cost_foreign"] = 0.0
+                            p["avg_fx"] = 1.0
+                            p["total_cost_twd"] = 0.0
+
+            # 用當日（或最後一日用 latest 價格）計算權益
+            total_mv_twd = 0.0
+            for tkr, p in pos.items():
+                if p["shares"] <= 0:
+                    continue
+                ccy = p["currency"]
+                if day == last_day:
+                    px_today = latest_prices.get(tkr, np.nan)
+                    if np.isnan(px_today):
+                        px_today = float(stock_close_daily.get(tkr, pd.Series(index=all_dates)).get(day, np.nan))
+                    fx_today = _latest_fx_safe(ccy)
+                else:
+                    px_today = float(stock_close_daily.get(tkr, pd.Series(index=all_dates)).get(day, np.nan))
+                    fx_today = float(fx_daily.get(ccy, pd.Series(index=all_dates)).get(day, np.nan))
+
+                if np.isnan(px_today) or np.isnan(fx_today):
+                    continue
+                total_mv_twd += px_today * p["shares"] * fx_today
+
+            total_equity_twd = total_mv_twd + cum_realized_twd
+            rows.append({"日期": day, label: round(total_equity_twd, 0)})
+
+        return pd.DataFrame(rows)
+                          
     # 11) Summary
     total_twd_cost = float(position_df["總成本(台幣)"].sum()) if not position_df.empty else 0.0
     total_twd_value= float(position_df["市值(台幣)"].sum()) if not position_df.empty else 0.0
@@ -760,6 +857,9 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
     # =====================================================
     comparison_results = []
     compare_sheets = {}
+
+    # === (新增) 把每個策略對應的「交易明細」留存，用來算每日權益曲線 ===
+    comparison_trade_sets = []  # list of (label, df_trades_like)
 
     # 預設標的（若使用者未選擇）
     default_targets = ["SPY", "0050.TW", "2330.TW"]
@@ -846,6 +946,9 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         compare_sheets[f"鏡像_{name}_庫存摘要"] = pos_m
         r = {"策略": f"鏡像-{name}"}; r.update(sum_m); comparison_results.append(r)
 
+        # === (新增) 供日權益曲線使用 ===
+        comparison_trade_sets.append((f"鏡像-{name}", df_m))
+
     # DCA（依勾選）
     for tgt in dca_targets:
         df_d = make_monthly_dca_trades(min_date, max_date, dca_amount_twd, tgt, fx_data_dict, stock_data_dict, dca_day=dca_day)
@@ -859,6 +962,9 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         compare_sheets[f"DCA_{name}_買賣明細"] = disp_d
         compare_sheets[f"DCA_{name}_庫存摘要"] = pos_d
         r = {"策略": f"DCA-{name}"}; r.update(sum_d); comparison_results.append(r)
+
+        # === (新增) 供日權益曲線使用 ===
+        comparison_trade_sets.append((f"DCA-{name}", df_d))
 
     # 原投組 summary 放第一列
     base_summary = {
@@ -885,6 +991,27 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         "figures": {"equity_curve": fig_equity},
         "report_bytes": make_excel_report(dataframes)
     }
+
+    # === (新增) 曲線彙整：把「你的投組」與每個策略做成同一張表 ===
+    # 基準曲線：你的投組（已算好）
+    base_curve = daily_portfolio_df[["日期", "投組總額_日報"]].rename(columns={"投組總額_日報": "你的投組(平均成本法)"})
+
+    # 把每個策略的日權益曲線合併到寬表
+    comparison_equity_wide = base_curve.copy()
+    for label, df_like in comparison_trade_sets:
+        curve = _equity_curve_for_trades(df_like, label)
+        if not curve.empty:
+            comparison_equity_wide = comparison_equity_wide.merge(curve, on="日期", how="left")
+
+    # 長表（便於 plotly 以顏色分組繪圖）
+    comparison_equity_long = comparison_equity_wide.melt(id_vars=["日期"], var_name="策略", value_name="權益(台幣)")
+    comparison_equity_long = comparison_equity_long.dropna(subset=["權益(台幣)"])
+
+    # 放進輸出包
+    dataframes["comparison_equity_wide"] = comparison_equity_wide
+    dataframes["comparison_equity_long"] = comparison_equity_long
+
+
 
 # ====== UI：比較標的與 DCA 參數 ======
 st.divider()
@@ -995,4 +1122,56 @@ if result:
                 "comparison_overview.csv",
                 "text/csv"
             )
+            
+            st.markdown("---")
+            st.subheader("📈 權益曲線比較（可多選）")
+
+            eq_wide = dfs.get("comparison_equity_wide")
+            eq_long = dfs.get("comparison_equity_long")
+
+            if eq_wide is not None and not eq_wide.empty and eq_long is not None and not eq_long.empty:
+                all_series = [c for c in eq_wide.columns if c != "日期"]
+                # 預設顯示：你的投組 + 第一個策略（若有）
+                default_series = ["你的投組(平均成本法)"] + ([s for s in all_series if s != "你的投組(平均成本法)"][:1])
+
+                picked = st.multiselect(
+                    "選擇要顯示的曲線",
+                    options=all_series,
+                    default=default_series,
+                    help="可多選。左列會一起畫在同一張圖上。"
+                )
+
+                if picked:
+                    plot_df = eq_long[eq_long["策略"].isin(picked)].copy()
+                    try:
+                        import plotly.express as px
+                        fig_cmp = px.line(
+                            plot_df,
+                            x="日期", y="權益(台幣)", color="策略",
+                            title="策略權益曲線比較（台幣）"
+                        )
+                        fig_cmp.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+                        st.plotly_chart(fig_cmp, use_container_width=True)
+                    except Exception:
+                        st.info("Plotly 無法載入，改以表格呈現。")
+                        st.dataframe(
+                            eq_wide[["日期"] + picked],
+                            use_container_width=True
+                        )
+                    # 下載曲線資料
+                    st.download_button(
+                        "comparison_equity_wide.csv",
+                        eq_wide.to_csv(index=False).encode("utf-8-sig"),
+                        "comparison_equity_wide.csv",
+                        "text/csv",
+                        use_container_width=True
+                    )
+                else:
+                    st.warning("請至少勾選一條曲線顯示。")
+            else:
+                st.info("尚無可用的曲線資料。請先執行分析並選擇比較標的。")
+
+
+
+
 
