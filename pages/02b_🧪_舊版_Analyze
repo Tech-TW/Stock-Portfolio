@@ -774,3 +774,4 @@ if result:
         st.dataframe(dfs["display_detail"], use_container_width=True)
         st.download_button("display_detail_legacy.csv", dfs["display_detail"].to_csv(index=False).encode("utf-8-sig"), "display_detail_legacy.csv", "text/csv")
 
+
