@@ -1,7 +1,8 @@
 # ──────────────────────────────────────────────────────────
 # 檔案：pages/03_📊_策略比較.py
 # 說明：比較標的條件設定 + 鏡像、DCA、Lump Sum 比較分析與曲線
-# 依賴：Upload 頁面已把 df 放入 st.session_state["uploaded_df"]
+# 特色：comparison_overview 欄位維持
+# ["策略","總成本(台幣)","市值(台幣)","未實現損益(台幣)","已實現損益(台幣)","總損益(台幣)","報酬率"]
 # ──────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -9,8 +10,8 @@ import pandas as pd
 import numpy as np
 from io import BytesIO
 from datetime import datetime, timedelta
-from collections import deque
 from dateutil.relativedelta import relativedelta
+from collections import deque
 import yfinance as yf
 
 st.title("📊 策略比較（鏡像 / DCA / Lump Sum）")
@@ -22,7 +23,7 @@ if "uploaded_df" not in st.session_state or st.session_state["uploaded_df"] is N
 
 df_input: pd.DataFrame = st.session_state["uploaded_df"].copy()
 
-# ========= 共用函式（與 02 頁一致；為了單檔可用，這裡再貼一次）=========
+# ========= 共用輔助 =========
 def make_excel_report(dfs: dict) -> bytes:
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
@@ -108,33 +109,6 @@ def download_stock_history(ticker: str, start_date: pd.Timestamp, end_date: pd.T
     except Exception:
         return pd.DataFrame()
 
-# ========= 股票分割事件處理（如需用到平均成本基礎曲線時可擴充） =========
-class StockEventProcessor:
-    def __init__(self):
-        self.events_data = {}
-
-    def fetch_stock_events(self, ticker, start_date, end_date):
-        events = {'splits': []}
-        try:
-            stock = yf.Ticker(ticker)
-            actions = stock.actions.reset_index()
-            if actions.empty:
-                self.events_data[ticker] = events
-                return events
-            actions["Date"] = actions["Date"].dt.tz_localize(None)
-            actions = actions[(actions["Date"]>=start_date)&(actions["Date"]<=end_date)].copy()
-            if "Stock Splits" in actions.columns:
-                s = actions[actions["Stock Splits"]>0][["Date","Stock Splits"]]
-                if not s.empty:
-                    s.columns = ["Date","Split_Ratio"]
-                    for _,r in s.iterrows():
-                        events["splits"].append({"date": r["Date"], "ratio": r["Stock Splits"], "type": "split"})
-        except Exception:
-            pass
-        self.events_data[ticker] = events
-        return events
-
-# ===== 投資比較：輔助函式 =====
 def get_price_on_or_before(date, ticker, stock_data_dict, min_date, max_date):
     if ticker not in stock_data_dict or stock_data_dict[ticker].empty:
         _df = download_stock_history(ticker, min_date, max_date)
@@ -147,6 +121,7 @@ def get_price_on_or_before(date, ticker, stock_data_dict, min_date, max_date):
         return float(sdf["收盤價"].iloc[0])
     return float(sdf.loc[mask, "收盤價"].iloc[-1])
 
+# ===== 交易生成（鏡像 / DCA / Lump Sum）=====
 def make_mirror_trades(df_trades, target_ticker, fx_data_dict, stock_data_dict, min_date, max_date):
     rows = []
     for _, r in df_trades.sort_values("日期").iterrows():
@@ -241,8 +216,105 @@ def make_lumpsum_trades_from_budget(df_all: pd.DataFrame, target_ticker: str,
         if col not in df_ls.columns: df_ls[col] = np.nan
     return df_ls
 
-# === 權益曲線（針對任意「交易明細 df」） ===
-def equity_curve_for_trades(df_trades_like: pd.DataFrame, all_dates, stock_close_daily, fx_daily, latest_prices, base_index) -> pd.DataFrame:
+# ===== 快速估值器：輸出與你原本相同欄位 =====
+def evaluate_portfolio_fast(df_trades_like: pd.DataFrame,
+                            latest_prices: dict,
+                            stock_close_daily: dict,
+                            fx_daily: dict,
+                            valuation_day: pd.Timestamp):
+    """
+    回傳 (position_df_alt, realized_dict, summary_alt)
+    summary_alt 欄位鍵包含：
+    ["總成本(台幣)","市值(台幣)","未實現損益(台幣)","已實現損益(台幣)","總損益(台幣)","報酬率"]
+    """
+    if df_trades_like is None or df_trades_like.empty:
+        return pd.DataFrame(), {}, {"總成本(台幣)":0.0,"市值(台幣)":0.0,"未實現損益(台幣)":0.0,"已實現損益(台幣)":0.0,"總損益(台幣)":0.0,"報酬率":np.nan}
+
+    pos = {}
+    realized = {}
+    dfl = df_trades_like.copy()
+    dfl["日期"] = pd.to_datetime(dfl["日期"]).dt.normalize()
+    dfl["交易成本"] = pd.to_numeric(dfl.get("交易成本", 0.0), errors="coerce").fillna(0.0)
+    dfl["換匯匯率"] = pd.to_numeric(dfl.get("換匯匯率", 1.0), errors="coerce").fillna(1.0)
+    if "幣別" not in dfl.columns:
+        dfl["幣別"] = dfl["股票代號"].apply(determine_currency)
+
+    for _, row in dfl.sort_values("日期").iterrows():
+        tkr = row["股票代號"]; sh = float(row["購買股數"]); px = float(row["購買股價"])
+        fx  = float(row.get("換匯匯率", 1.0)); fee = float(row.get("交易成本", 0.0))
+        ccy = row.get("幣別", determine_currency(tkr))
+        if tkr not in pos:
+            pos[tkr] = {"shares":0.0,"avg_cost_foreign":0.0,"avg_fx":1.0,"total_cost_twd":0.0,"currency":ccy}
+            realized[tkr] = 0.0
+        p = pos[tkr]
+        if sh > 0:
+            actual = (px*sh+fee)/sh
+            new_sh = p["shares"] + sh
+            new_cf = p["avg_cost_foreign"]*p["shares"] + actual*sh
+            new_ct = p["total_cost_twd"] + actual*sh*fx
+            p["shares"] = new_sh
+            if new_sh>0:
+                p["avg_cost_foreign"] = new_cf/new_sh
+                p["avg_fx"]           = (new_ct/new_cf) if new_cf>0 else 1.0
+                p["total_cost_twd"]   = p["avg_cost_foreign"]*p["shares"]*p["avg_fx"]
+            else:
+                p["avg_cost_foreign"]=0.0; p["avg_fx"]=1.0; p["total_cost_twd"]=0.0
+        else:
+            sell = abs(sh)
+            if p["shares"] < sell or p["shares"]<=0:
+                continue
+            gross = px*sell; net = gross - fee
+            total_foreign  = (net/sell - p["avg_cost_foreign"]) * sell
+            total_twd      = total_foreign * p["avg_fx"]
+            realized[tkr] += total_twd
+            p["shares"] -= sell
+            if p["shares"]>0:
+                p["total_cost_twd"] = p["avg_cost_foreign"]*p["shares"]*p["avg_fx"]
+            else:
+                p["avg_cost_foreign"]=0.0; p["avg_fx"]=1.0; p["total_cost_twd"]=0.0
+
+    rows=[]
+    for tkr, p in pos.items():
+        if p["shares"]<=0: continue
+        px_today = latest_prices.get(tkr, np.nan)
+        if np.isnan(px_today):
+            series = stock_close_daily.get(tkr)
+            px_today = float(series.get(valuation_day, np.nan)) if series is not None else np.nan
+        fx_today = float(fx_daily.get(p["currency"], pd.Series(index=[valuation_day])).iloc[-1]) if p["currency"] in fx_daily else (1.0 if p["currency"]=="TWD" else np.nan)
+        if np.isnan(px_today) or np.isnan(fx_today):
+            continue
+        mv_twd = px_today * p["shares"] * fx_today
+        unreal_invest_twd = (px_today - p["avg_cost_foreign"]) * p["shares"] * fx_today
+        unreal_total_twd  = mv_twd - p["total_cost_twd"]
+        rows.append({
+            "股票代號": tkr, "幣別": p["currency"], "持有股數": p["shares"],
+            "平均成本(原幣)": p["avg_cost_foreign"], "平均匯率成本": p["avg_fx"],
+            "總成本(台幣)": p["total_cost_twd"], "現價(原幣)": px_today,
+            "最新匯率": fx_today, "市值(台幣)": mv_twd,
+            "未實現投資損益(台幣)": unreal_invest_twd, "未實現總損益(台幣)": unreal_total_twd,
+            "未實現投資匯率損益(台幣)": unreal_total_twd - unreal_invest_twd
+        })
+
+    position_df_alt = pd.DataFrame(rows)
+    if not position_df_alt.empty and "股票代號" in position_df_alt.columns:
+        position_df_alt = position_df_alt.sort_values("股票代號")
+
+    realized_total_twd = sum(realized.values())
+    total_cost_twd = float(position_df_alt["總成本(台幣)"].sum()) if not position_df_alt.empty else 0.0
+    total_mv_twd   = float(position_df_alt["市值(台幣)"].sum()) if not position_df_alt.empty else 0.0
+    total_unreal_twd = float(position_df_alt["未實現總損益(台幣)"].sum()) if not position_df_alt.empty else 0.0
+    total_pnl_twd  = realized_total_twd + total_unreal_twd
+    total_return   = (total_pnl_twd / total_cost_twd) if total_cost_twd > 0 else np.nan
+
+    summary_alt = {
+        "總成本(台幣)": total_cost_twd, "市值(台幣)": total_mv_twd,
+        "未實現損益(台幣)": total_unreal_twd, "已實現損益(台幣)": realized_total_twd,
+        "總損益(台幣)": total_pnl_twd, "報酬率": total_return
+    }
+    return position_df_alt, realized, summary_alt
+
+# === 權益曲線（用於圖表） ===
+def equity_curve_for_trades(df_trades_like: pd.DataFrame, all_dates, stock_close_daily, fx_daily, latest_prices) -> pd.DataFrame:
     if df_trades_like is None or df_trades_like.empty:
         return pd.DataFrame(columns=["日期", "權益(台幣)"])
 
@@ -254,7 +326,8 @@ def equity_curve_for_trades(df_trades_like: pd.DataFrame, all_dates, stock_close
     df_like["日期"] = pd.to_datetime(df_like["日期"]).dt.normalize()
     df_like["交易成本"] = pd.to_numeric(df_like.get("交易成本", 0.0), errors="coerce").fillna(0.0)
     df_like["換匯匯率"] = pd.to_numeric(df_like.get("換匯匯率", 1.0), errors="coerce").fillna(1.0)
-    df_like["幣別"] = df_like.get("幣別", df_like["股票代號"].apply(determine_currency))
+    if "幣別" not in df_like.columns:
+        df_like["幣別"] = df_like["股票代號"].apply(determine_currency)
 
     like_by_day = {d: g for d, g in df_like.sort_values("日期").groupby("日期")}
     last_day_local = all_dates[-1]
@@ -281,10 +354,6 @@ def equity_curve_for_trades(df_trades_like: pd.DataFrame, all_dates, stock_close
                         p["avg_cost_foreign"] = new_cf / new_sh
                         p["avg_fx"]           = (new_ct / new_cf) if new_cf > 0 else 1.0
                         p["total_cost_twd"]   = p["avg_cost_foreign"] * p["shares"] * p["avg_fx"]
-                    else:
-                        p["avg_cost_foreign"] = 0.0
-                        p["avg_fx"] = 1.0
-                        p["total_cost_twd"] = 0.0
                 else:
                     sell = abs(sh)
                     if p["shares"] <= 0 or p["shares"] < sell:
@@ -297,10 +366,6 @@ def equity_curve_for_trades(df_trades_like: pd.DataFrame, all_dates, stock_close
                     p["shares"] -= sell
                     if p["shares"] > 0:
                         p["total_cost_twd"] = p["avg_cost_foreign"] * p["shares"] * p["avg_fx"]
-                    else:
-                        p["avg_cost_foreign"] = 0.0
-                        p["avg_fx"] = 1.0
-                        p["total_cost_twd"] = 0.0
 
         total_mv_twd = 0.0
         for tkr, p in pos.items():
@@ -324,11 +389,9 @@ def equity_curve_for_trades(df_trades_like: pd.DataFrame, all_dates, stock_close
         total_equity_twd = total_mv_twd + cum_realized_twd
         rows.append({"日期": day, "權益(台幣)": round(total_equity_twd, 0)})
 
-    out = pd.DataFrame(rows)
-    out = out.merge(base_index, on="日期", how="right")  # 對齊全域日期
-    return out
+    return pd.DataFrame(rows)
 
-# ========= 主流程（含比較）=========
+# ========= 主流程（含比較 + 維持欄位）=========
 def run_full_comparison(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
                         mirror_list=None, dca_list=None, dca_day: int = 1,
                         lumpsum_list=None, valuation_to_today: bool = True) -> dict:
@@ -358,6 +421,7 @@ def run_full_comparison(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
 
     today_tw = pd.Timestamp.today(tz="Asia/Taipei").normalize().tz_localize(None)
     end_of_range = today_tw if valuation_to_today else max_date
+    all_dates = pd.date_range(min_date, end_of_range, freq="D")
 
     # 匯率/股價歷史（原投組）
     currencies = df_trades[df_trades["幣別"]!="TWD"]["幣別"].dropna().unique()
@@ -372,8 +436,7 @@ def run_full_comparison(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         s = download_stock_history(tkr, min_date, end_of_range)
         if not s.empty: stock_data_dict[tkr] = s
 
-    # 構建全域日期與日頻序列容器
-    all_dates = pd.date_range(min_date, end_of_range, freq="D")
+    # 日頻序列容器
     stock_close_daily = {}
     for tkr, sdf in stock_data_dict.items():
         if sdf is None or sdf.empty: continue
@@ -424,7 +487,7 @@ def run_full_comparison(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
     if "TWD" not in fx_daily:
         fx_daily["TWD"] = pd.Series(1.0, index=all_dates)
 
-    # 最新價快取
+    # 最新價快取（估值日用）
     latest_prices={}
     for tkr in comp_tickers.union(set(tickers)):
         try:
@@ -434,53 +497,105 @@ def run_full_comparison(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
         except Exception:
             pass
 
-    # 產生比較交易集
+    # 產生比較交易集 & 匯總
     comparison_results = []
     compare_sheets = {}
-    comparison_trade_sets = []  # (label, df_trades_like)
+    comparison_trade_sets = []  # (label, df_trades_like) for curves
+
+    # 你的投組（作為第一列）
+    # 先用 evaluate_portfolio_fast 估值，欄位與原本一致
+    base_pos, _, base_sum = evaluate_portfolio_fast(
+        df_trades_like=df_trades,
+        latest_prices=latest_prices,
+        stock_close_daily=stock_close_daily,
+        fx_daily=fx_daily,
+        valuation_day=end_of_range
+    )
+    base_summary_row = {
+        "策略": "你的投組(平均成本法)",
+        **base_sum
+    }
+    comparison_results.append(base_summary_row)
 
     # 鏡像
     for tgt in mirror_targets:
         df_m = make_mirror_trades(df_trades, tgt, fx_data_dict, stock_data_dict, min_date, end_of_range)
         if df_m.empty: continue
+        pos_m, _, sum_m = evaluate_portfolio_fast(df_m, latest_prices, stock_close_daily, fx_daily, end_of_range)
         disp_m = df_m.copy().sort_values("日期")
         disp_m["歷史匯率"] = disp_m["換匯匯率"]
         disp_m = disp_m[["日期","股票代號","幣別","購買股數","購買股價","換匯匯率","歷史匯率","交易成本"]]
         name = tgt.replace(".TW","").replace(".T","")
         compare_sheets[f"鏡像_{name}_買賣明細"] = disp_m
+        compare_sheets[f"鏡像_{name}_庫存摘要"] = pos_m
+        comparison_results.append({"策略": f"鏡像-{name}", **sum_m})
         comparison_trade_sets.append((f"鏡像-{name}", df_m))
 
     # DCA
-    # 先暫存選項（稍後 UI 取得）
-    st.session_state.setdefault("compare_defaults", ["SPY", "0050.TW", "2330.TW"])
+    for tgt in dca_targets:
+        df_d = make_monthly_dca_trades(min_date, end_of_range, dca_amount_twd, tgt, fx_data_dict, stock_data_dict, dca_day=dca_day)
+        if df_d.empty: continue
+        pos_d, _, sum_d = evaluate_portfolio_fast(df_d, latest_prices, stock_close_daily, fx_daily, end_of_range)
+        disp_d = df_d.copy().sort_values("日期")
+        disp_d["歷史匯率"] = disp_d["換匯匯率"]
+        disp_d = disp_d[["日期","股票代號","幣別","購買股數","購買股價","換匯匯率","歷史匯率","交易成本"]]
+        name = tgt.replace(".TW","").replace(".T","")
+        compare_sheets[f"DCA_{name}_買賣明細"] = disp_d
+        compare_sheets[f"DCA_{name}_庫存摘要"] = pos_d
+        comparison_results.append({"策略": f"DCA-{name}", **sum_d})
+        comparison_trade_sets.append((f"DCA-{name}", df_d))
 
-    # 這裡的 dca_day/amount 將由 UI 控制；先給 placeholder，稍後覆寫
     # Lump Sum
     for tgt in lumpsum_targets:
         df_l = make_lumpsum_trades_from_budget(df, tgt, fx_data_dict, stock_data_dict,
                                                start_date=min_date, end_date=end_of_range)
         if df_l.empty: continue
+        pos_l, _, sum_l = evaluate_portfolio_fast(df_l, latest_prices, stock_close_daily, fx_daily, end_of_range)
         disp_l = df_l.copy().sort_values("日期")
         disp_l["歷史匯率"] = disp_l["換匯匯率"]
         disp_l = disp_l[["日期","股票代號","幣別","購買股數","購買股價","換匯匯率","歷史匯率","交易成本"]]
         name = tgt.replace(".TW","").replace(".T","")
         compare_sheets[f"LumpSum_{name}_買賣明細"] = disp_l
+        compare_sheets[f"LumpSum_{name}_庫存摘要"] = pos_l
+        comparison_results.append({"策略": f"LumpSum-{name}", **sum_l})
         comparison_trade_sets.append((f"LumpSum-{name}", df_l))
 
-    # 全域日期索引（DataFrame）
-    base_index = pd.DataFrame({"日期": all_dates})
+    # comparison_overview：欄位順序維持不變
+    comparison_df = pd.DataFrame(comparison_results)[
+        ["策略","總成本(台幣)","市值(台幣)","未實現損益(台幣)","已實現損益(台幣)","總損益(台幣)","報酬率"]
+    ].copy()
+
+    # 權益曲線（你的投組 + 各策略）
+    eq_wide = pd.DataFrame({"日期": all_dates})
+    eq_long_parts = []
+
+    base_curve = equity_curve_for_trades(df_trades, all_dates, stock_close_daily, fx_daily, latest_prices)\
+        .rename(columns={"權益(台幣)":"你的投組(平均成本法)"})
+    eq_wide = eq_wide.merge(base_curve, on="日期", how="left")
+    tmp_long = base_curve.rename(columns={"你的投組(平均成本法)":"權益(台幣)"})
+    tmp_long["策略"] = "你的投組(平均成本法)"
+    eq_long_parts.append(tmp_long[["日期","策略","權益(台幣)"]])
+
+    for label, df_like in comparison_trade_sets:
+        curve = equity_curve_for_trades(df_like, all_dates, stock_close_daily, fx_daily, latest_prices)
+        if not curve.empty:
+            eq_wide = eq_wide.merge(curve.rename(columns={"權益(台幣)": label}), on="日期", how="left")
+            c = curve.copy(); c["策略"] = label
+            eq_long_parts.append(c[["日期","策略","權益(台幣)"]])
+
+    eq_long = pd.concat(eq_long_parts, ignore_index=True) if eq_long_parts else pd.DataFrame(columns=["日期","策略","權益(台幣)"])
+
+    dataframes = {
+        "comparison_overview": comparison_df,
+        "comparison_equity_wide": eq_wide,
+        "comparison_equity_long": eq_long,
+        **compare_sheets
+    }
 
     return {
-        "meta": {"min_date":min_date, "max_date":max_date, "end_of_range":end_of_range},
-        "fx_data_dict": fx_data_dict,
-        "stock_data_dict": stock_data_dict,
-        "stock_close_daily": stock_close_daily,
-        "fx_daily": fx_daily,
-        "latest_prices": latest_prices,
-        "base_index": base_index,
-        "df_trades": df_trades,
-        "compare_sheets": compare_sheets,
-        "comparison_trade_sets_init": comparison_trade_sets  # 鏡像/LumpSum 已放進來；DCA 由 UI 再加
+        "meta":{"start":min_date,"end":max_date,"valuation_day":end_of_range,"records":len(df_trades)},
+        "dataframes": dataframes,
+        "report_bytes": make_excel_report(dataframes)
     }
 
 # ====== UI：比較標的、DCA 參數、估值日切換 ======
@@ -513,7 +628,7 @@ dca_amount_twd = st.number_input(
 if st.button("Run Comparison", type="primary"):
     with st.status("Running comparison...", expanded=False):
         try:
-            result_core = run_full_comparison(
+            result = run_full_comparison(
                 df_input,
                 dca_amount_twd=dca_amount_twd,
                 mirror_list=compare_choices,
@@ -522,87 +637,34 @@ if st.button("Run Comparison", type="primary"):
                 lumpsum_list=compare_choices,
                 valuation_to_today=valuation_to_today
             )
-            st.session_state["cmp_core"] = result_core
+            st.session_state["cmp_result"] = result
             st.session_state["compare_defaults"] = compare_choices
             st.success("Done!")
         except Exception as e:
             st.exception(e)
             st.stop()
 
-core = st.session_state.get("cmp_core")
-if core:
-    meta = core["meta"]
-    min_date, max_date, end_of_range = meta["min_date"], meta["max_date"], meta["end_of_range"]
-    fx_data_dict = core["fx_data_dict"]
-    stock_data_dict = core["stock_data_dict"]
-    stock_close_daily = core["stock_close_daily"]
-    fx_daily = core["fx_daily"]
-    latest_prices = core["latest_prices"]
-    base_index = core["base_index"]
-    df_trades = core["df_trades"]
-
-    # 先把 DCA 交易補上 comparison_trade_sets，再做估值
-    comparison_trade_sets = list(core["comparison_trade_sets_init"])  # 鏡像+LumpSum
-    for tgt in compare_choices:
-        df_d = make_monthly_dca_trades(min_date, end_of_range, dca_amount_twd, tgt, fx_data_dict, stock_data_dict, dca_day=dca_day)
-        if not df_d.empty:
-            comparison_trade_sets.append((f"DCA-{tgt.replace('.TW','').replace('.T','')}", df_d))
-
-    # 權益曲線 wide/long
-    all_dates = pd.date_range(min_date, end_of_range, freq="D")
-    eq_wide = base_index.rename(columns={"日期":"日期"}).copy()
-    eq_long_parts = []
-
-    # 你的投組（以 mirror 模擬器相同口徑跑一條 baseline：用原交易，但只估權益曲線）
-    # 這裡使用 equity_curve_for_trades 以確保口徑與比較一致
-    eq_base = equity_curve_for_trades(df_trades, all_dates, stock_close_daily, fx_daily, latest_prices, base_index).rename(columns={"權益(台幣)":"你的投組(平均成本法)"})
-    eq_wide = eq_wide.merge(eq_base, on="日期", how="left")
-    tmp_long = eq_base.rename(columns={"你的投組(平均成本法)":"權益(台幣)"})
-    tmp_long["策略"] = "你的投組(平均成本法)"
-    eq_long_parts.append(tmp_long[["日期","策略","權益(台幣)"]])
-
-    # 其他策略曲線
-    for label, df_like in comparison_trade_sets:
-        curve = equity_curve_for_trades(df_like, all_dates, stock_close_daily, fx_daily, latest_prices, base_index)
-        if not curve.empty:
-            eq_wide = eq_wide.merge(curve.rename(columns={"權益(台幣)": label}), on="日期", how="left")
-            c = curve.copy(); c["策略"] = label
-            eq_long_parts.append(c[["日期","策略","權益(台幣)"]])
-
-    eq_long = pd.concat(eq_long_parts, ignore_index=True) if eq_long_parts else pd.DataFrame(columns=["日期","策略","權益(台幣)"])
-
-    # 產出概覽（以估值日終點快照）
-    snapshots = []
-    valuation_day = end_of_range
-    final_row = eq_wide[eq_wide["日期"]==valuation_day]
-    if not final_row.empty:
-        for col in final_row.columns:
-            if col == "日期": continue
-            val = float(final_row.iloc[0][col]) if pd.notna(final_row.iloc[0][col]) else np.nan
-            if pd.notna(val):
-                snapshots.append({"策略": col, "權益(台幣)": round(val,0)})
-    overview_df = pd.DataFrame(snapshots)
-
-    # 明細報表彙整
-    dataframes = {"comparison_equity_wide": eq_wide, "comparison_equity_long": eq_long, "comparison_overview": overview_df}
-    for k, v in core["compare_sheets"].items():
-        dataframes[k] = v
+result = st.session_state.get("cmp_result")
+if result:
+    dfs = result["dataframes"]
+    meta = result["meta"]
+    vday = meta["valuation_day"]
 
     st.subheader("多策略 vs 你的投組（概覽）")
-    st.caption(f"估值日：{valuation_day.date()}")
-    st.dataframe(dataframes["comparison_overview"], width="stretch")
+    st.caption(f"估值日：{vday.date()}")
+    st.dataframe(dfs["comparison_overview"], width="stretch")
     st.download_button(
         "comparison_overview.csv",
-        dataframes["comparison_overview"].to_csv(index=False).encode("utf-8-sig"),
+        dfs["comparison_overview"].to_csv(index=False).encode("utf-8-sig"),
         "comparison_overview.csv",
         "text/csv"
     )
 
     st.markdown("---")
     st.subheader("📈 權益曲線比較（可多選）")
-    eq_w = dataframes["comparison_equity_wide"]; eq_l = dataframes["comparison_equity_long"]
-    if not eq_w.empty and not eq_l.empty:
-        all_series = [c for c in eq_w.columns if c != "日期"]
+    eq_wide = dfs["comparison_equity_wide"]; eq_long = dfs["comparison_equity_long"]
+    if not eq_wide.empty and not eq_long.empty:
+        all_series = [c for c in eq_wide.columns if c != "日期"]
         default_series = ["你的投組(平均成本法)"] + ([s for s in all_series if s != "你的投組(平均成本法)"][:1])
         picked = st.multiselect(
             "選擇要顯示的曲線",
@@ -611,7 +673,7 @@ if core:
             help="可多選。"
         )
         if picked:
-            plot_df = eq_l[eq_l["策略"].isin(picked)].copy()
+            plot_df = eq_long[eq_long["策略"].isin(picked)].copy()
             try:
                 import plotly.express as px
                 fig_cmp = px.line(
@@ -623,11 +685,11 @@ if core:
                 st.plotly_chart(fig_cmp, use_container_width=True)
             except Exception:
                 st.info("Plotly 無法載入，改以表格呈現。")
-                st.dataframe(eq_w[["日期"] + picked], width="stretch")
+                st.dataframe(eq_wide[["日期"] + picked], width="stretch")
 
             st.download_button(
                 "comparison_equity_wide.csv",
-                eq_w.to_csv(index=False).encode("utf-8-sig"),
+                eq_wide.to_csv(index=False).encode("utf-8-sig"),
                 "comparison_equity_wide.csv",
                 "text/csv"
             )
@@ -635,3 +697,4 @@ if core:
             st.warning("請至少勾選一條曲線顯示。")
     else:
         st.info("尚無可用的曲線資料。請先執行比較。")
+
