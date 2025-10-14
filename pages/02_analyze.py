@@ -1,6 +1,6 @@
 # ──────────────────────────────────────────────────────────
 # 檔案：pages/02_🚀_執行分析.py
-# 說明：執行分析、分頁顯示、下載報表（僅基礎投組分析；不含鏡像/DCA/Lump Sum）
+# 說明：執行分析、分頁顯示、下載報表（基礎投組分析；不含鏡像/DCA/Lump Sum 比較）
 # ──────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -12,7 +12,7 @@ from collections import deque
 from dateutil.relativedelta import relativedelta
 import yfinance as yf
 
-st.title("🚀 Analyze (基礎投組分析)")
+st.title("🚀 Analyze")
 
 # 取得上傳資料
 if "uploaded_df" not in st.session_state or st.session_state["uploaded_df"] is None:
@@ -272,7 +272,7 @@ def build_fifo_inventory_with_cost_fixed(df_trades, fx_data_dict, latest_prices=
 
     return pd.DataFrame(fifo_position_list), fifo_realized_pnl_data
 
-# ========= 主流程（只做基礎分析）=========
+# ========= 主流程（基礎分析；無策略比較）=========
 def run_base_analysis(trades_df: pd.DataFrame, valuation_to_today: bool = True) -> dict:
     # 1) 欄位準備
     df = trades_df.copy()
@@ -285,6 +285,7 @@ def run_base_analysis(trades_df: pd.DataFrame, valuation_to_today: bool = True) 
             raise ValueError(f"找不到必要欄位：{need}")
     if "交易成本" not in df.columns: df["交易成本"] = 0.0
     if "換匯匯率" not in df.columns: df["換匯匯率"] = 1.0
+
     if "幣別" not in df.columns:
         df["幣別"] = df["股票代號"].apply(determine_currency)
 
@@ -297,7 +298,7 @@ def run_base_analysis(trades_df: pd.DataFrame, valuation_to_today: bool = True) 
     min_date = df_trades["日期"].min()
     max_date = df_trades["日期"].max()
 
-    # 估值日設定
+    # 估值日設定：今天 or 最後交易日
     today_tw = pd.Timestamp.today(tz="Asia/Taipei").normalize().tz_localize(None)
     end_of_range = today_tw if valuation_to_today else max_date
     valuation_day = end_of_range
@@ -307,12 +308,14 @@ def run_base_analysis(trades_df: pd.DataFrame, valuation_to_today: bool = True) 
     fx_data_dict = {}
     for cur in currencies:
         f = download_fx_history(cur, min_date, end_of_range)
-        if not f.empty: fx_data_dict[cur] = f
+        if not f.empty:
+            fx_data_dict[cur] = f
     tickers = df_trades["股票代號"].dropna().unique()
     stock_data_dict = {}
     for tkr in tickers:
         s = download_stock_history(tkr, min_date, end_of_range)
-        if not s.empty: stock_data_dict[tkr] = s
+        if not s.empty:
+            stock_data_dict[tkr] = s
 
     # 3) 更新「購買當時匯率」（歷史匯率）
     df_trades["購買當時匯率_歷史"] = df_trades.apply(
@@ -421,19 +424,12 @@ def run_base_analysis(trades_df: pd.DataFrame, valuation_to_today: bool = True) 
         })
     position_df = pd.DataFrame(position_list)
 
-    # 7) 已實現損益、交易成本
+    # 7) 已實現損益、交易成本（⚠️ 修正 NameError）
     realized_df = pd.DataFrame([
         {"股票代號": t, "幣別": v["currency"], "已實現總損益(台幣)": v["total_realized_pnl"]}
-        for t,v in (position_data and {k: realized_pnl_data[k] for k in realized_pnl_data} or {}).items()
-        if abs(realized_pnl_data[k]["total_realized_pnl"])>1e-9
+        for t, v in realized_pnl_data.items()
+        if abs(v["total_realized_pnl"]) > 1e-9
     ])
-    # 如果上面的 list comprehension 因空 dict 造成 KeyError，保底：
-    if realized_df.empty and any(realized_pnl_data.values()):
-        realized_df = pd.DataFrame([
-            {"股票代號": t, "幣別": v["currency"], "已實現總損益(台幣)": v["total_realized_pnl"]}
-            for t,v in realized_pnl_data.items()
-            if abs(v["total_realized_pnl"])>1e-9
-        ])
 
     cost_df = pd.DataFrame([
         {"股票代號": t, "幣別": v["currency"], "累計交易成本(台幣)": v["total_cost"]}
@@ -455,19 +451,129 @@ def run_base_analysis(trades_df: pd.DataFrame, valuation_to_today: bool = True) 
     ]:
         display_df[col] = 0.0
 
-    try:
-        import plotly.express as px
-        # 10) 投組每日總彙整（到估值日）＋曲線
-        # 為簡化，僅用最新價估值的靜態 Summary 與明細，不額外跑日頻 NAV（需求在比較分頁）
-        fig_equity = None
-    except Exception:
-        fig_equity = None
+    # === 10) 投組每日總彙整（到估值日） ===
+    all_dates = pd.date_range(min_date, end_of_range, freq="D")
+
+    stock_close_daily = {}
+    for tkr, sdf in stock_data_dict.items():
+        if sdf is None or sdf.empty: continue
+        ser = sdf.set_index("日期")["收盤價"].sort_index()
+        ser.index = pd.to_datetime(ser.index).normalize()
+        stock_close_daily[tkr] = ser.reindex(all_dates).ffill()
+
+    fx_daily = {"TWD": pd.Series(1.0, index=all_dates)}
+    for cur, fdf in fx_data_dict.items():
+        if fdf is None or fdf.empty: continue
+        ser = fdf.set_index("日期")["匯率"].sort_index()
+        ser.index = pd.to_datetime(ser.index).normalize()
+        fx_daily[cur] = ser.reindex(all_dates).ffill()
+
+    if "預算餘額" in df.columns:
+        cash_series = df[["日期","預算餘額"]].dropna(subset=["日期"]).copy()
+        cash_series["日期"] = pd.to_datetime(cash_series["日期"]).dt.normalize()
+        cash_series["預算餘額"] = pd.to_numeric(cash_series["預算餘額"], errors="coerce")
+        cash_by_day = (
+            cash_series.sort_values(["日期"])
+            .drop_duplicates(subset=["日期"], keep="last")
+            .set_index("日期")["預算餘額"]
+            .reindex(all_dates).ffill().fillna(0.0)
+        )
+    else:
+        cash_by_day = pd.Series(0.0, index=all_dates)
+
+    positions = {}
+    cum_realized_twd = 0.0
+    trades_sorted = df_trades.sort_values("日期").copy()
+    trades_sorted["日期"] = trades_sorted["日期"].dt.normalize()
+    trades_by_day = {d:g for d,g in trades_sorted.groupby("日期")}
+
+    def _latest_fx_safe(cur):
+        v = get_latest_fx_rate(cur, fx_data_dict)
+        if np.isnan(v):
+            s = fx_daily.get(cur)
+            return float(s.iloc[-1]) if s is not None and len(s) else (1.0 if cur=="TWD" else np.nan)
+        return float(v)
+
+    daily_rows=[]
+    last_day = all_dates[-1]
+    for day in all_dates:
+        if day in trades_by_day:
+            for _, r in trades_by_day[day].iterrows():
+                tkr=r["股票代號"]; sh=float(r["購買股數"]); px=float(r["購買股價"])
+                ccy=r["幣別"]; fx=float(r["換匯匯率"]); fee=float(r["交易成本"])
+                if tkr not in positions:
+                    positions[tkr] = {"shares":0.0,"avg_cost_foreign":0.0,"pure_cost_foreign_total":0.0,
+                                      "avg_fx":0.0,"total_cost_twd":0.0,"currency":ccy}
+                p=positions[tkr]
+                if sh>0:
+                    actual = (px*sh+fee)/sh
+                    new_sh = p["shares"]+sh
+                    new_cf = p["avg_cost_foreign"]*p["shares"] + actual*sh
+                    new_ct = p["total_cost_twd"] + actual*sh*fx
+                    if new_sh>0:
+                        p["avg_cost_foreign"]= new_cf/new_sh
+                        p["avg_fx"]= (new_ct/new_cf) if new_cf>0 else 1.0
+                    p["shares"]=new_sh
+                    p["total_cost_twd"]=new_ct
+                    p["pure_cost_foreign_total"] += px*sh
+                else:
+                    sell = abs(sh)
+                    if p["shares"]>=sell and p["shares"]>0:
+                        gross = px*sell; net = gross - fee
+                        real_f = (net - p["avg_cost_foreign"]*sell)
+                        real_t = real_f * p["avg_fx"]
+                        cum_realized_twd += real_t
+                        cpp = (p["pure_cost_foreign_total"]/p["shares"])*sell if p["shares"]>0 else 0.0
+                        p["pure_cost_foreign_total"] -= cpp
+                        p["shares"] -= sell
+                        if p["shares"]>0:
+                            p["total_cost_twd"] = p["avg_cost_foreign"]*p["shares"]*p["avg_fx"]
+                        else:
+                            p["total_cost_twd"]=0.0; p["avg_cost_foreign"]=0.0; p["pure_cost_foreign_total"]=0.0
+
+        total_mv_twd=0.0; total_cost_twd=0.0; unreal_invest_twd=0.0
+        for tkr,p in positions.items():
+            if p["shares"]<=0: continue
+            ccy = p["currency"]
+            if day==last_day:
+                px_today = latest_prices.get(tkr, np.nan)
+                if np.isnan(px_today):
+                    px_today = float(stock_close_daily.get(tkr, pd.Series(index=all_dates)).get(day, np.nan))
+                fx_today = _latest_fx_safe(ccy)
+            else:
+                px_today = float(stock_close_daily.get(tkr, pd.Series(index=all_dates)).get(day, np.nan))
+                fx_today = float(fx_daily.get(ccy, pd.Series(index=all_dates)).get(day, np.nan))
+            if np.isnan(px_today) or np.isnan(fx_today): continue
+            mv_twd = px_today * p["shares"] * fx_today
+            total_mv_twd += mv_twd
+            total_cost_twd += p["total_cost_twd"]
+            unreal_invest_twd += (px_today - p["avg_cost_foreign"]) * p["shares"] * fx_today
+
+        unreal_total_twd = total_mv_twd - total_cost_twd
+        unreal_fx_twd    = unreal_total_twd - unreal_invest_twd
+        cash_twd = float(cash_by_day.get(day, 0.0))
+        total_equity_twd = cum_realized_twd + total_mv_twd
+        total_current_assets_twd = total_equity_twd + cash_twd
+
+        daily_rows.append({
+            "日期": day,
+            "總流動資產(台幣)": round(total_current_assets_twd,0),
+            "總權益(台幣)": round(total_equity_twd,0),
+            "總市值(台幣)": round(total_mv_twd,0),
+            "總成本(台幣)": round(total_cost_twd,0),
+            "已實現損益(台幣)": round(cum_realized_twd,0),
+            "未實現總損益(台幣)": round(unreal_total_twd,0),
+            "未實現投資損益(台幣)": round(unreal_invest_twd,0),
+            "未實現投資匯率損益(台幣)": round(unreal_fx_twd,0),
+            "現金部位(台幣)": round(cash_twd,0)
+        })
+    daily_portfolio_df = pd.DataFrame(daily_rows).rename(columns={"總權益(台幣)":"投組總額_日報"})
 
     # 11) Summary
-    total_twd_cost  = float(position_df["總成本(台幣)"].sum()) if not position_df.empty else 0.0
-    total_twd_value = float(position_df["市值(台幣)"].sum()) if not position_df.empty else 0.0
-    total_unreal    = float(position_df["未實現總損益(台幣)"].sum()) if not position_df.empty else 0.0
-    total_realized  = float(realized_df["已實現總損益(台幣)"].sum()) if not realized_df.empty else 0.0
+    total_twd_cost = float(position_df["總成本(台幣)"].sum()) if not position_df.empty else 0.0
+    total_twd_value= float(position_df["市值(台幣)"].sum()) if not position_df.empty else 0.0
+    total_unreal   = float(position_df["未實現總損益(台幣)"].sum()) if not position_df.empty else 0.0
+    total_realized = float(realized_df["已實現總損益(台幣)"].sum()) if not realized_df.empty else 0.0
     summary = pd.DataFrame({
         "指標":["期間","總筆數","總投資成本(台幣)","市值(台幣)","未實現損益(台幣)","已實現損益(台幣)","總損益(台幣)","報酬率(%)"],
         "值":[f"{min_date.date()} ~ {max_date.date()}",
@@ -476,6 +582,13 @@ def run_base_analysis(trades_df: pd.DataFrame, valuation_to_today: bool = True) 
              round(((total_unreal+total_realized)/total_twd_cost*100.0), 2) if total_twd_cost>0 else np.nan]
     })
 
+    # 12) 繪圖
+    try:
+        import plotly.express as px
+        fig_equity = px.line(daily_portfolio_df, x="日期", y="投組總額_日報", title="投組總額-日報")
+    except Exception:
+        fig_equity = None
+
     dataframes = {
         "summary": summary,
         "trades": df_trades,
@@ -483,6 +596,7 @@ def run_base_analysis(trades_df: pd.DataFrame, valuation_to_today: bool = True) 
         "positions_fifo": fifo_position_df,
         "realized": realized_df,
         "costs": cost_df,
+        "daily_equity": daily_portfolio_df[["日期","投組總額_日報"]],
         "display_detail": display_df
     }
 
@@ -493,24 +607,31 @@ def run_base_analysis(trades_df: pd.DataFrame, valuation_to_today: bool = True) 
         "report_bytes": make_excel_report(dataframes)
     }
 
-# ====== Run ======
+# ====== UI（維持原頁面風格；僅保留估值日切換） ======
+st.divider()
 valuation_mode = st.radio(
-    "估值日", options=["今天", "最後交易日 (max_date)"], index=0,
-    help="僅影響 summary/positions 等估值計算。"
+    "估值日",
+    options=["今天", "最後交易日 (max_date)"],
+    index=0,
+    help="決定明細與曲線最後一天使用的價格與匯率。"
 )
 valuation_to_today = (valuation_mode == "今天")
 
-if st.button("Run Analysis", type="primary"):
+# ====== Run ======
+if st.button("Run Analysis", type="primary", use_container_width=True):
     with st.status("Running analysis...", expanded=False):
         try:
-            result = run_base_analysis(df_input, valuation_to_today=valuation_to_today)
-            st.session_state["basic_analysis_result"] = result
+            result = run_base_analysis(
+                df_input,
+                valuation_to_today=valuation_to_today
+            )
+            st.session_state["analysis_result"] = result
             st.success("Done!")
         except Exception as e:
             st.exception(e)
             st.stop()
 
-result = st.session_state.get("basic_analysis_result")
+result = st.session_state.get("analysis_result")
 if result:
     dfs = result.get("dataframes", {})
     figs= result.get("figures", {})
@@ -522,43 +643,55 @@ if result:
         data=result.get("report_bytes"),
         file_name=f"portfolio_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
     )
 
-    tab_names = ["Summary", "Trades", "Positions (Avg)", "Positions (FIFO)", "Realized P/L", "Costs", "Detail (Buy/Sell)"]
+    tab_names = [
+        "Summary", "Trades", "Positions (Avg)", "Positions (FIFO)",
+        "Realized P/L", "Costs", "Daily Equity", "Detail (Buy/Sell)"
+    ]
     tabs = st.tabs(tab_names)
 
     with tabs[0]:
         st.subheader("Summary")
-        st.dataframe(dfs["summary"], width="stretch")
+        st.dataframe(dfs["summary"], use_container_width=True)
 
     with tabs[1]:
         st.subheader("Trades")
-        st.dataframe(dfs["trades"], width="stretch")
+        st.dataframe(dfs["trades"], use_container_width=True)
         st.download_button("trades.csv", dfs["trades"].to_csv(index=False).encode("utf-8-sig"), "trades.csv", "text/csv")
 
     with tabs[2]:
         st.subheader("Positions (Avg)")
-        st.dataframe(dfs["positions_avg"], width="stretch")
+        st.dataframe(dfs["positions_avg"], use_container_width=True)
         st.download_button("positions_avg.csv", dfs["positions_avg"].to_csv(index=False).encode("utf-8-sig"), "positions_avg.csv", "text/csv")
 
     with tabs[3]:
         st.subheader("Positions (FIFO)")
-        st.dataframe(dfs["positions_fifo"], width="stretch")
+        st.dataframe(dfs["positions_fifo"], use_container_width=True)
         st.download_button("positions_fifo.csv", dfs["positions_fifo"].to_csv(index=False).encode("utf-8-sig"), "positions_fifo.csv", "text/csv")
 
     with tabs[4]:
         st.subheader("Realized P/L")
-        st.dataframe(dfs["realized"], width="stretch")
+        st.dataframe(dfs["realized"], use_container_width=True)
         st.download_button("realized.csv", dfs["realized"].to_csv(index=False).encode("utf-8-sig"), "realized.csv", "text/csv")
 
     with tabs[5]:
         st.subheader("Costs")
-        st.dataframe(dfs["costs"], width="stretch")
+        st.dataframe(dfs["costs"], use_container_width=True)
         st.download_button("costs.csv", dfs["costs"].to_csv(index=False).encode("utf-8-sig"), "costs.csv", "text/csv")
 
     with tabs[6]:
+        st.subheader("Daily Equity / NAV Curve")
+        st.caption(f"估值日：{vday.date() if vday is not None else '—'}")
+        st.dataframe(dfs["daily_equity"], use_container_width=True)
+        if figs.get("equity_curve") is not None:
+            st.plotly_chart(figs["equity_curve"], use_container_width=True)
+        st.download_button("daily_equity.csv", dfs["daily_equity"].to_csv(index=False).encode("utf-8-sig"), "daily_equity.csv", "text/csv")
+
+    with tabs[7]:
         st.subheader("Detail (Buy/Sell) with P/L Columns")
-        st.dataframe(dfs["display_detail"], width="stretch")
+        st.dataframe(dfs["display_detail"], use_container_width=True)
         st.download_button("display_detail.csv", dfs["display_detail"].to_csv(index=False).encode("utf-8-sig"), "display_detail.csv", "text/csv")
 
 
