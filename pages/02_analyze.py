@@ -820,89 +820,99 @@ def run_full_analysis(trades_df: pd.DataFrame, dca_amount_twd: int = 70000,
     lumpsum_targets= lumpsum_list if lumpsum_list else default_targets
 
     # 供快照估值用（與曲線一致）
+        # 供快照估值用（與曲線一致）
     def _evaluate_portfolio_fast(df_trades_like: pd.DataFrame):
-    if df_trades_like is None or df_trades_like.empty:
-        return pd.DataFrame(), {}, {"總成本(台幣)":0.0,"市值(台幣)":0.0,"未實現損益(台幣)":0.0,"已實現損益(台幣)":0.0,"總損益(台幣)":0.0,"報酬率":np.nan}
+        if df_trades_like is None or df_trades_like.empty:
+            return pd.DataFrame(), {}, {
+                "總成本(台幣)": 0.0, "市值(台幣)": 0.0,
+                "未實現損益(台幣)": 0.0, "已實現損益(台幣)": 0.0,
+                "總損益(台幣)": 0.0, "報酬率": np.nan
+            }
 
-    pos = {}
-    realized = {}
-    for _, row in df_trades_like.sort_values("日期").iterrows():
-        tkr = row["股票代號"]; sh = float(row["購買股數"]); px = float(row["購買股價"])
-        fx  = float(row.get("換匯匯率", 1.0)); fee = float(row.get("交易成本", 0.0))
-        ccy = row.get("幣別", determine_currency(tkr))
-        if tkr not in pos:
-            pos[tkr] = {"shares":0.0,"avg_cost_foreign":0.0,"avg_fx":1.0,"total_cost_twd":0.0,"currency":ccy}
-            realized[tkr] = 0.0
-        p = pos[tkr]
-        if sh > 0:
-            actual = (px*sh+fee)/sh
-            new_sh = p["shares"] + sh
-            new_cf = p["avg_cost_foreign"]*p["shares"] + actual*sh
-            new_ct = p["total_cost_twd"] + actual*sh*fx
-            p["shares"] = new_sh
-            if new_sh>0:
-                p["avg_cost_foreign"] = new_cf/new_sh
-                p["avg_fx"]           = (new_ct/new_cf) if new_cf>0 else 1.0
-                p["total_cost_twd"]   = p["avg_cost_foreign"]*p["shares"]*p["avg_fx"]
+        pos = {}
+        realized = {}
+        for _, row in df_trades_like.sort_values("日期").iterrows():
+            tkr = row["股票代號"]; sh = float(row["購買股數"]); px = float(row["購買股價"])
+            fx  = float(row.get("換匯匯率", 1.0)); fee = float(row.get("交易成本", 0.0))
+            ccy = row.get("幣別", determine_currency(tkr))
+            if tkr not in pos:
+                pos[tkr] = {"shares": 0.0, "avg_cost_foreign": 0.0, "avg_fx": 1.0,
+                            "total_cost_twd": 0.0, "currency": ccy}
+                realized[tkr] = 0.0
+            p = pos[tkr]
+            if sh > 0:
+                actual = (px * sh + fee) / sh
+                new_sh = p["shares"] + sh
+                new_cf = p["avg_cost_foreign"] * p["shares"] + actual * sh
+                new_ct = p["total_cost_twd"] + actual * sh * fx
+                p["shares"] = new_sh
+                if new_sh > 0:
+                    p["avg_cost_foreign"] = new_cf / new_sh
+                    p["avg_fx"]           = (new_ct / new_cf) if new_cf > 0 else 1.0
+                    p["total_cost_twd"]   = p["avg_cost_foreign"] * p["shares"] * p["avg_fx"]
+                else:
+                    p["avg_cost_foreign"] = 0.0; p["avg_fx"] = 1.0; p["total_cost_twd"] = 0.0
             else:
-                p["avg_cost_foreign"]=0.0; p["avg_fx"]=1.0; p["total_cost_twd"]=0.0
-        else:
-            sell = abs(sh)
-            if p["shares"] < sell or p["shares"]<=0: 
+                sell = abs(sh)
+                if p["shares"] < sell or p["shares"] <= 0:
+                    continue
+                gross = px * sell
+                net   = gross - fee
+                total_foreign = (net / sell - p["avg_cost_foreign"]) * sell
+                total_twd     = total_foreign * p["avg_fx"]
+                realized[tkr] += total_twd
+                p["shares"] -= sell
+                if p["shares"] > 0:
+                    p["total_cost_twd"] = p["avg_cost_foreign"] * p["shares"] * p["avg_fx"]
+                else:
+                    p["avg_cost_foreign"] = 0.0; p["avg_fx"] = 1.0; p["total_cost_twd"] = 0.0
+
+        rows = []
+        valuation_day_local = daily_portfolio_df["日期"].iloc[-1]
+        for tkr, p in pos.items():
+            if p["shares"] <= 0:
                 continue
-            gross = px*sell; net = gross - fee
-            total_foreign  = (net/sell - p["avg_cost_foreign"]) * sell
-            total_twd      = total_foreign * p["avg_fx"]
-            realized[tkr] += total_twd
-            p["shares"] -= sell
-            if p["shares"]>0:
-                p["total_cost_twd"] = p["avg_cost_foreign"]*p["shares"]*p["avg_fx"]
-            else:
-                p["avg_cost_foreign"]=0.0; p["avg_fx"]=1.0; p["total_cost_twd"]=0.0
+            px_today = latest_prices.get(tkr, np.nan)
+            if np.isnan(px_today):
+                px_today = float(
+                    stock_close_daily.get(tkr, pd.Series(index=daily_portfolio_df["日期"]))
+                    .get(valuation_day_local, np.nan)
+                )
+            fx_today = get_latest_fx_rate(p["currency"], fx_data_dict)
+            if np.isnan(fx_today):
+                tmp = fx_daily.get(p["currency"])
+                fx_today = float(tmp.iloc[-1]) if tmp is not None and len(tmp) else (1.0 if p["currency"] == "TWD" else np.nan)
+            if np.isnan(px_today) or np.isnan(fx_today):
+                continue
+            mv_twd = px_today * p["shares"] * fx_today
+            unreal_invest_twd = (px_today - p["avg_cost_foreign"]) * p["shares"] * fx_today
+            unreal_total_twd  = mv_twd - p["total_cost_twd"]
+            rows.append({
+                "股票代號": tkr, "幣別": p["currency"], "持有股數": p["shares"],
+                "平均成本(原幣)": p["avg_cost_foreign"], "平均匯率成本": p["avg_fx"],
+                "總成本(台幣)": p["total_cost_twd"], "現價(原幣)": px_today,
+                "最新匯率": fx_today, "市值(台幣)": mv_twd,
+                "未實現投資損益(台幣)": unreal_invest_twd, "未實現總損益(台幣)": unreal_total_twd,
+                "未實現投資匯率損益(台幣)": unreal_total_twd - unreal_invest_twd
+            })
 
-    rows=[]
-    valuation_day_local = daily_portfolio_df["日期"].iloc[-1]
-    for tkr, p in pos.items():
-        if p["shares"]<=0: continue
-        px_today = latest_prices.get(tkr, np.nan)
-        if np.isnan(px_today):
-            px_today = float(stock_close_daily.get(tkr, pd.Series(index=daily_portfolio_df["日期"])).get(valuation_day_local, np.nan))
-        fx_today = get_latest_fx_rate(p["currency"], fx_data_dict)
-        if np.isnan(fx_today):
-            tmp = fx_daily.get(p["currency"])
-            fx_today = float(tmp.iloc[-1]) if tmp is not None and len(tmp) else (1.0 if p["currency"]=="TWD" else np.nan)
-        if np.isnan(px_today) or np.isnan(fx_today): 
-            continue
-        mv_twd = px_today * p["shares"] * fx_today
-        unreal_invest_twd = (px_today - p["avg_cost_foreign"]) * p["shares"] * fx_today
-        unreal_total_twd  = mv_twd - p["total_cost_twd"]
-        rows.append({
-            "股票代號": tkr, "幣別": p["currency"], "持有股數": p["shares"],
-            "平均成本(原幣)": p["avg_cost_foreign"], "平均匯率成本": p["avg_fx"],
-            "總成本(台幣)": p["total_cost_twd"], "現價(原幣)": px_today,
-            "最新匯率": fx_today, "市值(台幣)": mv_twd,
-            "未實現投資損益(台幣)": unreal_invest_twd, "未實現總損益(台幣)": unreal_total_twd,
-            "未實現投資匯率損益(台幣)": unreal_total_twd - unreal_invest_twd
-        })
+        # 防呆：空表不排序
+        position_df_alt = pd.DataFrame(rows)
+        if not position_df_alt.empty and "股票代號" in position_df_alt.columns:
+            position_df_alt = position_df_alt.sort_values("股票代號")
 
-    # 🔧 防呆：rows 可能為空，先建表再判斷是否需要排序
-    position_df_alt = pd.DataFrame(rows)
-    if not position_df_alt.empty and "股票代號" in position_df_alt.columns:
-        position_df_alt = position_df_alt.sort_values("股票代號")
-
-    realized_total_twd = sum(realized.values())
-    total_cost_twd = float(position_df_alt["總成本(台幣)"].sum()) if not position_df_alt.empty else 0.0
-    total_mv_twd   = float(position_df_alt["市值(台幣)"].sum()) if not position_df_alt.empty else 0.0
-    total_unreal_twd = float(position_df_alt["未實現總損益(台幣)"].sum()) if not position_df_alt.empty else 0.0
-    total_pnl_twd  = realized_total_twd + total_unreal_twd
-    total_return   = (total_pnl_twd / total_cost_twd) if total_cost_twd > 0 else np.nan
-    summary_alt = {
-        "總成本(台幣)": total_cost_twd, "市值(台幣)": total_mv_twd,
-        "未實現損益(台幣)": total_unreal_twd, "已實現損益(台幣)": realized_total_twd,
-        "總損益(台幣)": total_pnl_twd, "報酬率": total_return
-    }
-    return position_df_alt, realized, summary_alt
-
+        realized_total_twd = sum(realized.values())
+        total_cost_twd   = float(position_df_alt["總成本(台幣)"].sum()) if not position_df_alt.empty else 0.0
+        total_mv_twd     = float(position_df_alt["市值(台幣)"].sum()) if not position_df_alt.empty else 0.0
+        total_unreal_twd = float(position_df_alt["未實現總損益(台幣)"].sum()) if not position_df_alt.empty else 0.0
+        total_pnl_twd    = realized_total_twd + total_unreal_twd
+        total_return     = (total_pnl_twd / total_cost_twd) if total_cost_twd > 0 else np.nan
+        summary_alt = {
+            "總成本(台幣)": total_cost_twd, "市值(台幣)": total_mv_twd,
+            "未實現損益(台幣)": total_unreal_twd, "已實現損益(台幣)": realized_total_twd,
+            "總損益(台幣)": total_pnl_twd, "報酬率": total_return
+        }
+        return position_df_alt, realized, summary_alt
 
     # 鏡像
     for tgt in mirror_targets:
