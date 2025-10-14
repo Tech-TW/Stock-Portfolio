@@ -1,7 +1,6 @@
 # ──────────────────────────────────────────────────────────
-# 檔案：pages/02_🚀_執行分析.py
-# 說明：執行分析、分頁顯示、下載報表
-# 你只要把現有分析流程貼進 run_full_analysis() 即可
+# 檔案：pages/02b_🧪_舊版_Analyze.py
+# 說明：保留你提供的「舊版本」基礎分析頁，與新版並存以利比較
 # ──────────────────────────────────────────────────────────
 
 # pages/02_analyze.py
@@ -16,7 +15,7 @@ from dateutil.relativedelta import relativedelta
 import yfinance as yf
 from tqdm import tqdm
 
-st.title("🚀 Analyze")
+st.title("🧪 Analyze（舊版比較）")
 
 # 取得上傳資料
 if "uploaded_df" not in st.session_state or st.session_state["uploaded_df"] is None:
@@ -272,7 +271,7 @@ def build_fifo_inventory_with_cost_fixed(df_trades, fx_data_dict, latest_prices=
             "總成本(台幣)": total_cost_twd,
             "最新匯率": latest_fx,
             "現價(原幣)": last_px,
-            "現價(台幣)": (last_px*latest_fx if not (np.isnan(last_px) or np.isnan(latest_fx)) else np.nan),
+            "現價(台幣)": (last_px*最新匯率 if not (np.isnan(last_px) or np.isnan(latest_fx)) else np.nan),
             "市值(原幣)": mv_foreign,
             "市值(台幣)": mv_twd,
             "未實現投資損益(原幣)": unreal_foreign,
@@ -537,8 +536,8 @@ def run_full_analysis(trades_df: pd.DataFrame) -> dict:
             for lot in buy_lots:
                 remain = float(lot["remain"])
                 if remain<=0: continue
-                unreal_invest_twd = (latest_px - pool_avg_cost_foreign) * remain * latest_fx
-                unreal_total_twd  = (latest_px * latest_fx * remain) - (pool_avg_cost_foreign * pool_avg_fx * remain)
+                unreal_invest_twd = (最新價 - pool_avg_cost_foreign) * remain * latest_fx
+                unreal_total_twd  = (最新價 * latest_fx * remain) - (pool_avg_cost_foreign * pool_avg_fx * remain)
                 unreal_fx_twd     = unreal_total_twd - unreal_invest_twd
                 bidx = lot["idx"]
                 display_df.loc[bidx, "未實現投資損益(台幣)"]   += unreal_invest_twd
@@ -705,26 +704,26 @@ def run_full_analysis(trades_df: pd.DataFrame) -> dict:
     }
 
 # ====== UI ======
-if st.button("Run Analysis", type="primary", use_container_width=True):
-    with st.status("Running analysis...", expanded=False):
+if st.button("Run Analysis (Legacy)", type="primary", use_container_width=True):
+    with st.status("Running analysis (legacy)...", expanded=False):
         try:
             result = run_full_analysis(df_input)
-            st.session_state["analysis_result"] = result
+            st.session_state["analysis_result_legacy"] = result
             st.success("Done!")
         except Exception as e:
             st.exception(e)
             st.stop()
 
-result = st.session_state.get("analysis_result")
+result = st.session_state.get("analysis_result_legacy")
 if result:
     dfs = result.get("dataframes", {})
     figs= result.get("figures", {})
 
-    # 下載整包報表
+    # 下載整包報表（標註 legacy 檔名）
     st.download_button(
-        "Download Excel Report",
+        "Download Excel Report (Legacy)",
         data=result.get("report_bytes"),
-        file_name=f"portfolio_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+        file_name=f"portfolio_report_legacy_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
@@ -735,42 +734,43 @@ if result:
     ])
 
     with tabs[0]:
-        st.subheader("Summary")
+        st.subheader("Summary (Legacy)")
         st.dataframe(dfs["summary"], use_container_width=True)
 
     with tabs[1]:
-        st.subheader("Trades")
+        st.subheader("Trades (Legacy)")
         st.dataframe(dfs["trades"], use_container_width=True)
-        st.download_button("trades.csv", dfs["trades"].to_csv(index=False).encode("utf-8-sig"), "trades.csv", "text/csv")
+        st.download_button("trades_legacy.csv", dfs["trades"].to_csv(index=False).encode("utf-8-sig"), "trades_legacy.csv", "text/csv")
 
     with tabs[2]:
-        st.subheader("Positions (Avg)")
+        st.subheader("Positions (Avg) (Legacy)")
         st.dataframe(dfs["positions_avg"], use_container_width=True)
-        st.download_button("positions_avg.csv", dfs["positions_avg"].to_csv(index=False).encode("utf-8-sig"), "positions_avg.csv", "text/csv")
+        st.download_button("positions_avg_legacy.csv", dfs["positions_avg"].to_csv(index=False).encode("utf-8-sig"), "positions_avg_legacy.csv", "text/csv")
 
     with tabs[3]:
-        st.subheader("Positions (FIFO)")
+        st.subheader("Positions (FIFO) (Legacy)")
         st.dataframe(dfs["positions_fifo"], use_container_width=True)
-        st.download_button("positions_fifo.csv", dfs["positions_fifo"].to_csv(index=False).encode("utf-8-sig"), "positions_fifo.csv", "text/csv")
+        st.download_button("positions_fifo_legacy.csv", dfs["positions_fifo"].to_csv(index=False).encode("utf-8-sig"), "positions_fifo_legacy.csv", "text/csv")
 
     with tabs[4]:
-        st.subheader("Realized P/L")
+        st.subheader("Realized P/L (Legacy)")
         st.dataframe(dfs["realized"], use_container_width=True)
-        st.download_button("realized.csv", dfs["realized"].to_csv(index=False).encode("utf-8-sig"), "realized.csv", "text/csv")
+        st.download_button("realized_legacy.csv", dfs["realized"].to_csv(index=False).encode("utf-8-sig"), "realized_legacy.csv", "text/csv")
 
     with tabs[5]:
-        st.subheader("Costs")
+        st.subheader("Costs (Legacy)")
         st.dataframe(dfs["costs"], use_container_width=True)
-        st.download_button("costs.csv", dfs["costs"].to_csv(index=False).encode("utf-8-sig"), "costs.csv", "text/csv")
+        st.download_button("costs_legacy.csv", dfs["costs"].to_csv(index=False).encode("utf-8-sig"), "costs_legacy.csv", "text/csv")
 
     with tabs[6]:
-        st.subheader("Daily Equity / NAV Curve")
+        st.subheader("Daily Equity / NAV Curve (Legacy)")
         st.dataframe(dfs["daily_equity"], use_container_width=True)
         if figs.get("equity_curve") is not None:
             st.plotly_chart(figs["equity_curve"], use_container_width=True)
-        st.download_button("daily_equity.csv", dfs["daily_equity"].to_csv(index=False).encode("utf-8-sig"), "daily_equity.csv", "text/csv")
+        st.download_button("daily_equity_legacy.csv", dfs["daily_equity"].to_csv(index=False).encode("utf-8-sig"), "daily_equity_legacy.csv", "text/csv")
 
     with tabs[7]:
-        st.subheader("Detail (Buy/Sell) with P/L Columns")
+        st.subheader("Detail (Buy/Sell) with P/L Columns (Legacy)")
         st.dataframe(dfs["display_detail"], use_container_width=True)
-        st.download_button("display_detail.csv", dfs["display_detail"].to_csv(index=False).encode("utf-8-sig"), "display_detail.csv", "text/csv")
+        st.download_button("display_detail_legacy.csv", dfs["display_detail"].to_csv(index=False).encode("utf-8-sig"), "display_detail_legacy.csv", "text/csv")
+
