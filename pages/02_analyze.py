@@ -628,6 +628,21 @@ def run_full_analysis(trades_df: pd.DataFrame, valuation_to_today: bool = True) 
         })
     daily_portfolio_df = pd.DataFrame(daily_rows).rename(columns={"總權益(台幣)":"投組總額_日報"})
 
+    # === NEW: 月底月報表（總成本、總市值） =========================================
+    # 以 daily_portfolio_df 的逐日數據，取各月份的月底一筆
+    if not daily_portfolio_df.empty:
+        monthly_eom_df = (
+            daily_portfolio_df
+            .set_index("日期")[["總成本(台幣)", "總市值(台幣)"]]
+            .resample("M")
+            .last()
+            .reset_index()
+            .rename(columns={"日期": "月底"})
+        )
+    else:
+        monthly_eom_df = pd.DataFrame(columns=["月底","總成本(台幣)","總市值(台幣)"])
+    # =========================================================================
+
     # 11) Summary
     total_twd_cost = float(position_df["總成本(台幣)"].sum()) if not position_df.empty else 0.0
     total_twd_value= float(position_df["市值(台幣)"].sum()) if not position_df.empty else 0.0
@@ -656,7 +671,9 @@ def run_full_analysis(trades_df: pd.DataFrame, valuation_to_today: bool = True) 
         "realized": realized_df,
         "costs": cost_df,
         "daily_equity": daily_portfolio_df[["日期","投組總額_日報"]],
-        "display_detail": display_df
+        "display_detail": display_df,
+        # === NEW: 加入月報表到導出字典 ===
+        "monthly_eom": monthly_eom_df
     }
     return {
         "meta":{"start":min_date,"end":max_date,"records":len(df_trades),"valuation_day":valuation_day,"valuation_to_today":valuation_to_today},
@@ -703,7 +720,7 @@ if result:
 
     tabs = st.tabs([
         "Summary", "Trades", "Positions (Avg)", "Positions (FIFO)",
-        "Realized P/L", "Costs", "Daily Equity", "Detail (Buy/Sell)"
+        "Realized P/L", "Costs", "Daily Equity", "Monthly EoM", "Detail (Buy/Sell)"
     ])
 
     with tabs[0]:
@@ -744,7 +761,14 @@ if result:
             st.plotly_chart(figs["equity_curve"], use_container_width=True)
         st.download_button("daily_equity.csv", dfs["daily_equity"].to_csv(index=False).encode("utf-8-sig"), "daily_equity.csv", "text/csv")
 
+    # === NEW: Monthly EoM Tab ===
     with tabs[7]:
+        st.subheader("Monthly EoM（月底）")
+        st.caption("每月月底的『總成本(台幣)』與『總市值(台幣)』。來源：每日估值日一致口徑資料。")
+        st.dataframe(dfs["monthly_eom"], use_container_width=True)
+        st.download_button("monthly_eom.csv", dfs["monthly_eom"].to_csv(index=False).encode("utf-8-sig"), "monthly_eom.csv", "text/csv")
+
+    with tabs[8]:
         st.subheader("Detail (Buy/Sell) with P/L Columns")
         st.dataframe(dfs["display_detail"], use_container_width=True)
         st.download_button("display_detail.csv", dfs["display_detail"].to_csv(index=False).encode("utf-8-sig"), "display_detail.csv", "text/csv")
